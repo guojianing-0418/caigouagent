@@ -1,0 +1,44 @@
+{
+  "risks": [
+    {
+      "material_name": "P725PRO左轴功率模组",
+      "module": "功率模块",
+      "risk_type": "关键性能风险",
+      "risk_reason": "功率模组涉及功率测量精度和校准一致性，计划阶段需要采购提前确认供应能力。",
+      "source_basis": "mock：PRD 提到功率测量精度和校准要求。"
+    },
+    {
+      "material_name": "P725PRO轴心-左侧",
+      "module": "踏板模块",
+      "risk_type": "定制工艺风险",
+      "risk_reason": "轴心零件存在定制加工、公差和装配匹配要求，可能影响周期和良率。",
+      "source_basis": "mock：BOM 中存在轴心零件，结构件加工和公差需关注。"
+    },
+    {
+      "material_name": "待确认物料",
+      "module": "",
+      "risk_type": "接口匹配风险",
+      "risk_reason": "群聊中提到接口件匹配问题，但无法确认对应 BOM 物料。",
+      "source_basis": "mock：飞书群消息提到接口件需确认。"
+    }
+  ],
+  "questions": [
+    {
+      "question_kind": "risk_material_mapping",
+      "input_type": "single_select",
+      "title": "确认接口件对应物料",
+      "message": "群聊中的接口件应对应哪个 BOM 物料？",
+      "reason": "无法从消息中直接绑定 BOM 物料。",
+      "options": ["P725PRO左轴功率模组 | 功率模块", "P725PRO轴心-左侧 | 踏板模块"],
+      "blocking": false,
+      "required": true,
+      "permission": "ask",
+      "context": {
+        "source_excerpt": "mock：飞书群消息提到接口件需确认。",
+        "effect": "update_material_name"
+      },
+      "related_risk_ids": [],
+      "allow_custom": true
+    }
+  ]
+}

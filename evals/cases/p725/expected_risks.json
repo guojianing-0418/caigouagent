@@ -1,0 +1,12 @@
+[
+  {
+    "material_name": "P725PRO左轴功率模组",
+    "risk_type": "关键性能风险",
+    "evidence_keywords": ["功率", "精度", "校准"]
+  },
+  {
+    "material_name": "P725PRO轴心-左侧",
+    "risk_type": "定制工艺风险",
+    "evidence_keywords": ["轴心", "加工", "公差"]
+  }
+]

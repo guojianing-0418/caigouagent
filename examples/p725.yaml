@@ -1,0 +1,8 @@
+project_name: P725计划阶段风险识别
+bom_path: P725脚踏功率计 结构EBOM.xlsx
+prd_path: P725功率计PRD V1.xlsx
+spec_path:
+drawing_dir:
+rd_risk_path:
+lark_chat:
+

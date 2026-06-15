@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   AlertCircle,
@@ -58,12 +58,14 @@ function App() {
   const [history, setHistory] = useState([]);
   const [questions, setQuestions] = useState([]);
   const [activeQuestion, setActiveQuestion] = useState(null);
+  const [exportBlockedInfo, setExportBlockedInfo] = useState(null);
   const [risks, setRisks] = useState([]);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
   const projectId = project?.id;
+  const questionsPanelRef = useRef(null);
   const modelReady = Boolean(modelStatus?.openai_base_url && modelStatus?.has_api_key && modelStatus?.text_model);
 
   useEffect(() => {
@@ -82,13 +84,32 @@ function App() {
     [project, modelReady, activeQuestion]
   );
   const panelQuestions = useMemo(
-    () => questions.filter((question) => !activeQuestion || question.id !== activeQuestion.id),
+    () => sortQuestionsByPriority(questions.filter((question) => !activeQuestion || question.id !== activeQuestion.id)),
     [questions, activeQuestion]
   );
-  const requiredQuestionCount = useMemo(
-    () => questions.filter((question) => question.required).length,
-    [questions]
+  const allPendingQuestions = useMemo(() => {
+    const byId = new Map();
+    for (const question of questions) {
+      byId.set(question.id, question);
+    }
+    if (activeQuestion) {
+      byId.set(activeQuestion.id, activeQuestion);
+    }
+    return Array.from(byId.values());
+  }, [questions, activeQuestion]);
+  const blockingQuestionCount = useMemo(
+    () => allPendingQuestions.filter((question) => question.blocking).length,
+    [allPendingQuestions]
   );
+  const requiredQuestionCount = useMemo(
+    () => allPendingQuestions.filter((question) => question.required).length,
+    [allPendingQuestions]
+  );
+  const optionalQuestionCount = useMemo(
+    () => allPendingQuestions.filter((question) => !question.required && !question.blocking).length,
+    [allPendingQuestions]
+  );
+  const totalQuestionCount = allPendingQuestions.length;
 
   async function loadModelSettings() {
     try {
@@ -196,6 +217,9 @@ function App() {
       setQuestions(pendingQuestions);
       setActiveQuestion(active);
       setRisks(riskRows);
+      if (pendingQuestions.length === 0 && !active) {
+        setExportBlockedInfo(null);
+      }
       await loadHistory();
     } catch (err) {
       setError(err.message);
@@ -233,16 +257,23 @@ function App() {
     try {
       const check = await request(`/api/projects/${project.id}/export/check`);
       if (!check.allowed) {
-        setError(check.message || "仍有必答问题未处理，不能下载正式 Excel。");
+        setExportBlockedInfo(check);
+        setError("");
+        setNotice("");
         await refreshProject(project.id);
         return;
       }
+      setExportBlockedInfo(null);
       window.location.href = `/api/projects/${project.id}/export`;
     } catch (err) {
       setError(err.message);
     } finally {
       setBusy(false);
     }
+  }
+
+  function scrollToQuestions() {
+    questionsPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   async function openHistoryProject(id) {
@@ -376,6 +407,13 @@ function App() {
         <section className="right-pane">
           <Panel icon={<Bot size={18} />} title="运行状态" description={project ? project.current_step : "请先创建项目。"}>
             <StatusStrip project={project} />
+            <ConfirmationSummary
+              project={project}
+              totalCount={totalQuestionCount}
+              blockingCount={blockingQuestionCount}
+              requiredCount={requiredQuestionCount}
+              optionalCount={optionalQuestionCount}
+            />
             <LogList logs={project?.logs || []} />
           </Panel>
 
@@ -383,9 +421,16 @@ function App() {
             icon={<MessageSquareText size={18} />}
             title="人工确认"
             description={`待处理 ${questions.length} 个，必答 ${requiredQuestionCount} 个。`}
+            panelRef={questionsPanelRef}
           >
+            <QuestionPriorityNote
+              totalCount={totalQuestionCount}
+              blockingCount={blockingQuestionCount}
+              requiredCount={requiredQuestionCount}
+              optionalCount={optionalQuestionCount}
+            />
             {panelQuestions.length === 0 ? (
-              <EmptyText text="当前没有待确认问题。" />
+              <EmptyText text="当前无待确认问题，可直接查看或导出结果。" />
             ) : (
               <div className="question-list">
                 {panelQuestions.map((question) => (
@@ -396,6 +441,7 @@ function App() {
           </Panel>
 
           <Panel icon={<FileSpreadsheet size={18} />} title="风险物料预览" description={`当前 ${risks.length} 条。`}>
+            {exportBlockedInfo && <ExportGateCard info={exportBlockedInfo} onJump={scrollToQuestions} />}
             <RiskTable risks={risks} />
             {requiredQuestionCount > 0 && (
               <p className="hint-text export-gate-text">
@@ -426,6 +472,73 @@ function BlockingQuestionModal({ question, busy, onAnswer }) {
         <QuestionRenderer question={question} busy={busy} onAnswer={onAnswer} blocking />
       </section>
     </div>
+  );
+}
+
+function ConfirmationSummary({ project, totalCount, blockingCount, requiredCount, optionalCount }) {
+  const hasQuestions = totalCount > 0;
+  let message = "当前无待确认问题，可直接查看或导出结果。";
+  if (hasQuestions && project?.status === "done") {
+    message = "识别已完成，但还有确认项待处理。";
+  } else if (hasQuestions) {
+    message = "Agent 已生成确认项，请优先处理阻塞和导出前必答问题。";
+  }
+
+  return (
+    <div className={`confirm-summary ${hasQuestions ? "has-items" : ""}`}>
+      <div className="confirm-summary-counts">
+        <MetricPill label="阻塞问题" value={blockingCount} tone={blockingCount > 0 ? "danger" : "neutral"} />
+        <MetricPill label="导出前必答" value={requiredCount} tone={requiredCount > 0 ? "warning" : "neutral"} />
+        <MetricPill label="可选确认" value={optionalCount} tone="neutral" />
+      </div>
+      <p>{message}</p>
+    </div>
+  );
+}
+
+function MetricPill({ label, value, tone = "neutral" }) {
+  return (
+    <span className={`metric-pill ${tone}`}>
+      <strong>{value}</strong>
+      {label}
+    </span>
+  );
+}
+
+function QuestionPriorityNote({ totalCount, blockingCount, requiredCount, optionalCount }) {
+  if (!totalCount) return null;
+  return (
+    <div className="question-priority-note">
+      <span>处理顺序</span>
+      <strong>阻塞 {blockingCount}</strong>
+      <strong>导出前必答 {requiredCount}</strong>
+      <strong>可选 {optionalCount}</strong>
+    </div>
+  );
+}
+
+function ExportGateCard({ info, onJump }) {
+  const questions = Array.isArray(info?.questions) ? info.questions : [];
+  return (
+    <section className="export-gate-card">
+      <div>
+        <h3>暂不能导出正式 Excel</h3>
+        <p>{info?.message || "仍有导出前必答问题未处理。"}</p>
+      </div>
+      {questions.length > 0 && (
+        <ul>
+          {questions.slice(0, 10).map((question) => (
+            <li key={question.id}>
+              <strong>{question.title}</strong>
+              {question.reason && <span>{question.reason}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      <button className="secondary-button compact" type="button" onClick={onJump}>
+        查看待确认问题
+      </button>
+    </section>
   );
 }
 
@@ -464,11 +577,11 @@ function QuestionRenderer({ question, busy, onAnswer, blocking = false }) {
   }
 
   return (
-    <article className={`question question-renderer ${blocking ? "blocking" : ""}`}>
+    <article className={`question question-renderer ${questionClassName(question, blocking)}`}>
       <div className="question-meta">
         <span>{questionKindLabel(question.question_kind)}</span>
-        {question.blocking && <span>阻塞</span>}
-        {question.required && <span>必答</span>}
+        {question.blocking && <span className="tag-danger">阻塞</span>}
+        {question.required ? <span className="tag-warning">导出前必答</span> : <span>可选</span>}
         <span>{permissionLabel(question.permission)}</span>
       </div>
       <div className="question-copy">
@@ -603,13 +716,37 @@ function parseCustomValues(value) {
     .filter(Boolean);
 }
 
+function sortQuestionsByPriority(items) {
+  return [...items].sort((left, right) => questionPriority(left) - questionPriority(right));
+}
+
+function questionPriority(question) {
+  if (question.blocking) return 0;
+  if (question.required) return 1;
+  return 2;
+}
+
+function questionClassName(question, blocking) {
+  if (blocking || question.blocking) return "blocking";
+  if (question.required) return "required";
+  return "optional";
+}
+
+function formatConfidence(value) {
+  if (value === null || value === undefined || value === "") return "";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  const percent = number <= 1 ? Math.round(number * 100) : Math.round(number);
+  return `置信度 ${Math.max(0, Math.min(100, percent))}%`;
+}
+
 function appendFile(form, name, file) {
   if (file) form.append(name, file);
 }
 
-function Panel({ icon, title, description, children }) {
+function Panel({ icon, title, description, children, panelRef }) {
   return (
-    <section className="panel">
+    <section className="panel" ref={panelRef}>
       <div className="panel-header">
         <span className="panel-icon">{icon}</span>
         <div>
@@ -693,12 +830,36 @@ function RiskTable({ risks }) {
               <td>{risk.material_name}</td>
               <td>{risk.module}</td>
               <td>{risk.risk_type}</td>
-              <td>{risk.risk_reason}</td>
+              <td>
+                <div className="risk-reason-cell">
+                  <span>{risk.risk_reason}</span>
+                  <RiskUncertainty risk={risk} />
+                </div>
+              </td>
               <td>{risk.source_basis}</td>
             </tr>
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function RiskUncertainty({ risk }) {
+  const confidence = formatConfidence(risk.confidence);
+  const unresolved = Array.isArray(risk.unresolved_questions) ? risk.unresolved_questions.filter(Boolean) : [];
+  if (!confidence && unresolved.length === 0) return null;
+  return (
+    <div className="risk-uncertainty">
+      {confidence && <span className="confidence-chip">{confidence}</span>}
+      {unresolved.length > 0 && (
+        <div className="unresolved-list">
+          <strong>待确认点</strong>
+          {unresolved.map((item, index) => (
+            <span key={`${item}-${index}`}>{item}</span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -729,4 +890,7 @@ function EmptyText({ text }) {
   return <p className="empty-text">{text}</p>;
 }
 
-createRoot(document.getElementById("root")).render(<App />);
+const rootElement = document.getElementById("root");
+const root = window.__procurementRiskAgentRoot || createRoot(rootElement);
+window.__procurementRiskAgentRoot = root;
+root.render(<App />);

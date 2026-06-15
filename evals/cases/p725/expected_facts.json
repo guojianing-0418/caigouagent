@@ -1,0 +1,18 @@
+[
+  {
+    "fact_type": "规格/版本",
+    "keywords": ["KEO", "SPD-SL", "SPD"]
+  },
+  {
+    "fact_type": "材料要求",
+    "keywords": ["轴心", "沉淀硬化型不锈钢"]
+  },
+  {
+    "fact_type": "性能指标",
+    "keywords": ["±1.0%"]
+  },
+  {
+    "fact_type": "认证要求",
+    "keywords": ["Ant+", "Bluetooth", "CE", "FCC", "RoHs"]
+  }
+]

@@ -12,8 +12,9 @@ from .exporter import export_risks
 from .lark_client import fetch_messages_by_chat
 from .llm_client import require_model_ready
 from .models import MaterialRecord, ProjectState, Question, RiskItem
+from .fact_rules import extract_document_facts, format_facts_for_prompt
 from .parsers.bom_parser import parse_bom
-from .parsers.document_parser import parse_document_lines
+from .parsers.document_ingestor import ingest_document
 from .parsers.drawing_parser import parse_drawing_folder
 from .parsers.rd_risk_parser import parse_rd_risk_excel
 from .risk_rules import (
@@ -50,6 +51,7 @@ def run_plan_stage(state: ProjectState) -> ProjectState:
     state.status = "running"
     state.error = None
     state.risks = []
+    state.facts = []
     state.export_path = None
     # 重新运行时保留已回答问题作为去重依据，清掉旧的非阻塞 pending 问题，避免重复生成。
     state.questions = [
@@ -92,18 +94,20 @@ def _run_with_langgraph_if_available(initial: AgentState) -> AgentState:
         from langgraph.graph import END, StateGraph
     except Exception:
         current = initial
-        for node in [_node_parse_inputs, _node_fetch_lark, _node_extract_risks, _node_merge_and_question]:
+        for node in [_node_parse_inputs, _node_fetch_lark, _node_extract_facts, _node_extract_risks, _node_merge_and_question]:
             current = node(current)
         return current
 
     graph = StateGraph(AgentState)
     graph.add_node("parse_inputs", _node_parse_inputs)
     graph.add_node("fetch_lark", _node_fetch_lark)
+    graph.add_node("extract_facts", _node_extract_facts)
     graph.add_node("extract_risks", _node_extract_risks)
     graph.add_node("merge_and_question", _node_merge_and_question)
     graph.set_entry_point("parse_inputs")
     graph.add_edge("parse_inputs", "fetch_lark")
-    graph.add_edge("fetch_lark", "extract_risks")
+    graph.add_edge("fetch_lark", "extract_facts")
+    graph.add_edge("extract_facts", "extract_risks")
     graph.add_edge("extract_risks", "merge_and_question")
     graph.add_edge("merge_and_question", END)
     return graph.compile().invoke(initial)
@@ -119,12 +123,18 @@ def _node_parse_inputs(state: AgentState) -> AgentState:
     materials = parse_bom(project.config.bom_path)
     append_log(project, f"BOM 解析完成，识别物料 {len(materials)} 条。")
 
-    prd_lines = parse_document_lines(project.config.prd_path)
+    prd_result = ingest_document(project.config.prd_path, source_name="PRD", max_units=800)
+    prd_lines = prd_result.lines(max_lines=800)
     append_log(project, f"PRD 文本线索 {len(prd_lines)} 条。")
+    if prd_result.diagnostics.warnings:
+        append_log(project, f"PRD 解析提示：{'；'.join(prd_result.diagnostics.warnings[:3])}")
 
-    spec_lines = parse_document_lines(project.config.spec_path)
+    spec_result = ingest_document(project.config.spec_path, source_name="规格书", max_units=800)
+    spec_lines = spec_result.lines(max_lines=800)
     if project.config.spec_path:
         append_log(project, f"规格书文本线索 {len(spec_lines)} 条。")
+        if spec_result.diagnostics.warnings:
+            append_log(project, f"规格书解析提示：{'；'.join(spec_result.diagnostics.warnings[:3])}")
 
     drawing_lines = parse_drawing_folder(project.config.drawing_dir)
     if project.config.drawing_dir:
@@ -135,10 +145,45 @@ def _node_parse_inputs(state: AgentState) -> AgentState:
         append_log(project, f"研发自提风险 {len(rd_records)} 条。")
 
     project.__dict__["_prd_lines"] = prd_lines
+    project.__dict__["_prd_units"] = prd_result.units
     project.__dict__["_spec_lines"] = spec_lines
+    project.__dict__["_spec_units"] = spec_result.units
     project.__dict__["_drawing_lines"] = drawing_lines
     project.__dict__["_rd_records"] = rd_records
     return {**state, "project": project, "materials": materials}
+
+
+def _node_extract_facts(state: AgentState) -> AgentState:
+    """节点：从 PRD / 规格书抽取产品事实。"""
+
+    project = state["project"]
+    if active_question(project):
+        project.current_step = "等待人工确认"
+        save_project(project)
+        return {**state, "project": project}
+
+    project.current_step = "抽取产品事实"
+    save_project(project)
+
+    human_context = build_human_answer_context(project)
+    facts = []
+    prd_units = project.__dict__.get("_prd_units", [])
+    if prd_units:
+        try:
+            facts.extend(extract_document_facts(prd_units, source_name="PRD", project_id=project.id, human_context=human_context))
+        except Exception as exc:
+            append_log(project, f"PRD 产品事实抽取失败，继续执行风险识别：{exc}")
+    spec_units = project.__dict__.get("_spec_units", [])
+    if spec_units:
+        try:
+            facts.extend(extract_document_facts(spec_units, source_name="规格书", project_id=project.id, human_context=human_context))
+        except Exception as exc:
+            append_log(project, f"规格书产品事实抽取失败，继续执行风险识别：{exc}")
+
+    project.facts = facts
+    append_log(project, f"产品事实 {len(facts)} 条。")
+    save_project(project)
+    return {**state, "project": project}
 
 
 def _node_fetch_lark(state: AgentState) -> AgentState:
@@ -174,16 +219,19 @@ def _node_extract_risks(state: AgentState) -> AgentState:
     risks: list[RiskItem] = []
     generated_questions: list[Question] = []
     human_context = build_human_answer_context(project)
+    fact_context = format_facts_for_prompt(project.facts)
     if human_context:
         append_log(project, "已加载人工确认上下文，后续模型识别会参考已提交答案。")
+    if fact_context:
+        append_log(project, "已加载产品事实上下文，后续风险识别会参考事实层。")
     # 按来源顺序抽取；若某个来源产生阻塞问题，立即暂停，等待采购回答。
     extractors = [
-        lambda: extract_bom_risks(materials, project.id, human_context=human_context),
-        lambda: extract_document_risks(project.__dict__.get("_prd_lines", []), materials, "PRD", project.id, human_context=human_context),
-        lambda: extract_document_risks(project.__dict__.get("_spec_lines", []), materials, "规格书", project.id, human_context=human_context),
-        lambda: extract_document_risks(project.__dict__.get("_drawing_lines", []), materials, "PDF图纸", project.id, human_context=human_context),
-        lambda: extract_rd_risks(project.__dict__.get("_rd_records", []), materials, project.id, human_context=human_context),
-        lambda: extract_lark_risks(project.__dict__.get("_lark_messages", []), materials, project.id, human_context=human_context),
+        lambda: extract_bom_risks(materials, project.id, human_context=human_context, fact_context=fact_context),
+        lambda: extract_document_risks(project.__dict__.get("_prd_lines", []), materials, "PRD", project.id, human_context=human_context, fact_context=fact_context),
+        lambda: extract_document_risks(project.__dict__.get("_spec_lines", []), materials, "规格书", project.id, human_context=human_context, fact_context=fact_context),
+        lambda: extract_document_risks(project.__dict__.get("_drawing_lines", []), materials, "PDF图纸", project.id, human_context=human_context, fact_context=fact_context),
+        lambda: extract_rd_risks(project.__dict__.get("_rd_records", []), materials, project.id, human_context=human_context, fact_context=fact_context),
+        lambda: extract_lark_risks(project.__dict__.get("_lark_messages", []), materials, project.id, human_context=human_context, fact_context=fact_context),
     ]
     for extractor in extractors:
         source_risks, source_questions = extractor()

@@ -26,6 +26,89 @@ RISK_TYPES = [
     "接口匹配风险",
 ]
 
+FACT_TYPES = [
+    "性能指标",
+    "材料要求",
+    "认证要求",
+    "规格/版本",
+    "成本目标",
+    "使用环境",
+    "结构/接口",
+    "区域/销售约束",
+    "开发/交付约束",
+]
+
+
+class DocumentSourceRef(BaseModel):
+    """可追溯到原始文档位置的来源引用。"""
+
+    source_name: str = ""
+    file_name: str = ""
+    sheet: str = ""
+    row_number: int = 0
+    page_number: int = 0
+    parser: str = ""
+    excerpt: str = ""
+
+
+class DocumentTextUnit(BaseModel):
+    """统一文档摄取后的一条文本单元。"""
+
+    text: str
+    source_name: str = ""
+    file_name: str = ""
+    sheet: str = ""
+    row_number: int = 0
+    page_number: int = 0
+    parser: str = ""
+    raw_text: str = ""
+
+    def as_line(self) -> str:
+        """转换成兼容现有大模型提示词的文本行。"""
+
+        if self.sheet and self.row_number:
+            prefix = f"{self.sheet} R{self.row_number}"
+        elif self.page_number:
+            prefix = f"{self.file_name} P{self.page_number}"
+        else:
+            prefix = self.file_name or self.source_name or "文档"
+        return f"{prefix}: {self.text}"
+
+
+class DocumentIngestionDiagnostics(BaseModel):
+    """文档摄取质量诊断。"""
+
+    file_name: str = ""
+    parser: str = ""
+    text_unit_count: int = 0
+    non_empty_cell_count: int = 0
+    suspicious_title_only: bool = False
+    warnings: list[str] = Field(default_factory=list)
+
+
+class DocumentIngestionResult(BaseModel):
+    """统一文档摄取结果。"""
+
+    units: list[DocumentTextUnit] = Field(default_factory=list)
+    diagnostics: DocumentIngestionDiagnostics = Field(default_factory=DocumentIngestionDiagnostics)
+
+    def lines(self, max_lines: int | None = None) -> list[str]:
+        """返回兼容旧解析入口的文本行。"""
+
+        lines = [unit.as_line() for unit in self.units]
+        return lines[:max_lines] if max_lines else lines
+
+
+class FactItem(BaseModel):
+    """从 PRD / 规格书等文档抽取出的产品事实。"""
+
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    fact_type: str
+    subject: str
+    value: str
+    source_basis: str
+    source_refs: list[DocumentSourceRef] = Field(default_factory=list)
+
 
 class MaterialRecord(BaseModel):
     """从 BOM 中解析出的物料记录。"""
@@ -61,6 +144,9 @@ class RiskItem(BaseModel):
     risk_type: str
     risk_reason: str
     source_basis: str
+    evidence_items: list[DocumentSourceRef] = Field(default_factory=list)
+    confidence: float | None = None
+    unresolved_questions: list[str] = Field(default_factory=list)
 
 
 QuestionInputType = Literal["single_select", "multi_select", "boolean", "text", "textarea"]
@@ -165,6 +251,7 @@ class ProjectState(BaseModel):
     config: ProjectConfig
     logs: list[str] = Field(default_factory=list)
     risks: list[RiskItem] = Field(default_factory=list)
+    facts: list[FactItem] = Field(default_factory=list)
     questions: list[Question] = Field(default_factory=list)
     export_path: str | None = None
     error: str | None = None

@@ -16,7 +16,7 @@ from typing import Any
 
 from .config import get_effective_settings
 from .llm_client import call_json_required
-from .models import LarkMessage, MaterialRecord, Question, RISK_TYPES, RiskItem
+from .models import DocumentSourceRef, FactItem, LarkMessage, MaterialRecord, Question, RISK_TYPES, RiskItem
 from .question_engine import create_question
 from .storage import load_llm_cache, save_llm_cache
 
@@ -34,13 +34,41 @@ RISK_OUTPUT_JSON_SCHEMA = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["material_name", "module", "risk_type", "risk_reason", "source_basis"],
+                "required": [
+                    "material_name",
+                    "module",
+                    "risk_type",
+                    "risk_reason",
+                    "source_basis",
+                    "evidence_items",
+                    "confidence",
+                    "unresolved_questions",
+                ],
                 "properties": {
                     "material_name": {"type": "string"},
                     "module": {"type": "string"},
                     "risk_type": {"type": "string", "enum": RISK_TYPES},
                     "risk_reason": {"type": "string"},
                     "source_basis": {"type": "string"},
+                    "evidence_items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["source_name", "file_name", "sheet", "row_number", "page_number", "parser", "excerpt"],
+                            "properties": {
+                                "source_name": {"type": "string"},
+                                "file_name": {"type": "string"},
+                                "sheet": {"type": "string"},
+                                "row_number": {"type": "integer"},
+                                "page_number": {"type": "integer"},
+                                "parser": {"type": "string"},
+                                "excerpt": {"type": "string"},
+                            },
+                        },
+                    },
+                    "confidence": {"type": "number"},
+                    "unresolved_questions": {"type": "array", "items": {"type": "string"}},
                 },
             },
         },
@@ -103,7 +131,10 @@ RISK_JSON_SCHEMA = """
       "module": "所属模块，可为空",
       "risk_type": "必须从指定风险类型中选择",
       "risk_reason": "面向采购的风险原因，一句话到两句话",
-      "source_basis": "来源与依据，说明来自哪个文件/消息/行，并引用关键依据"
+      "source_basis": "来源与依据，说明来自哪个文件/消息/行，并引用关键依据",
+      "evidence_items": [{"source_name": "PRD", "file_name": "文件名", "sheet": "工作表", "row_number": 1, "page_number": 0, "parser": "解析器", "excerpt": "证据原文"}],
+      "confidence": 0.8,
+      "unresolved_questions": ["仍需采购或研发确认的问题；没有则返回空数组"]
     }
   ],
   "questions": [
@@ -152,7 +183,12 @@ def normalize_name(name: str) -> str:
 ExtractionBundle = tuple[list[RiskItem], list[Question]]
 
 
-def extract_bom_risks(materials: list[MaterialRecord], project_id: str = "", human_context: str = "") -> ExtractionBundle:
+def extract_bom_risks(
+    materials: list[MaterialRecord],
+    project_id: str = "",
+    human_context: str = "",
+    fact_context: str = "",
+) -> ExtractionBundle:
     """用大模型从 BOM 识别计划阶段采购风险物料。"""
 
     lines = [
@@ -160,7 +196,7 @@ def extract_bom_risks(materials: list[MaterialRecord], project_id: str = "", hum
         f"name={item.name}; spec={item.spec}; material={item.material}; quantity={item.quantity}"
         for item in materials
     ]
-    return _extract_with_llm("草 BOM", lines, materials, project_id=project_id, human_context=human_context)
+    return _extract_with_llm("草 BOM", lines, materials, project_id=project_id, human_context=human_context, fact_context=fact_context)
 
 
 def extract_document_risks(
@@ -169,10 +205,11 @@ def extract_document_risks(
     source_name: str,
     project_id: str = "",
     human_context: str = "",
+    fact_context: str = "",
 ) -> ExtractionBundle:
     """用大模型从 PRD、规格书或 PDF 图纸线索中识别风险物料。"""
 
-    return _extract_with_llm(source_name, lines, materials, project_id=project_id, human_context=human_context)
+    return _extract_with_llm(source_name, lines, materials, project_id=project_id, human_context=human_context, fact_context=fact_context)
 
 
 def extract_rd_risks(
@@ -180,6 +217,7 @@ def extract_rd_risks(
     materials: list[MaterialRecord],
     project_id: str = "",
     human_context: str = "",
+    fact_context: str = "",
 ) -> ExtractionBundle:
     """用大模型理解研发自提风险并归入统一输出结构。"""
 
@@ -187,7 +225,7 @@ def extract_rd_risks(
         f"sheet={record.get('sheet', '')}; 风险物料名称={record.get('material_name', '')}; 原因={record.get('reason', '')}"
         for record in records
     ]
-    return _extract_with_llm("研发自提风险", lines, materials, project_id=project_id, human_context=human_context)
+    return _extract_with_llm("研发自提风险", lines, materials, project_id=project_id, human_context=human_context, fact_context=fact_context)
 
 
 def extract_lark_risks(
@@ -195,6 +233,7 @@ def extract_lark_risks(
     materials: list[MaterialRecord],
     project_id: str = "",
     human_context: str = "",
+    fact_context: str = "",
 ) -> ExtractionBundle:
     """用大模型从飞书群历史消息中识别风险物料。"""
 
@@ -203,7 +242,7 @@ def extract_lark_risks(
         for msg in messages
         if msg.content.strip()
     ]
-    return _extract_with_llm("飞书项目群历史消息", lines, materials, max_chars=10000, project_id=project_id, human_context=human_context)
+    return _extract_with_llm("飞书项目群历史消息", lines, materials, max_chars=10000, project_id=project_id, human_context=human_context, fact_context=fact_context)
 
 
 def merge_risks(risks: list[RiskItem]) -> list[RiskItem]:
@@ -218,6 +257,7 @@ def merge_risks(risks: list[RiskItem]) -> list[RiskItem]:
         first = items[0]
         reasons = _dedupe_text([item.risk_reason for item in items])
         bases = _dedupe_text([item.source_basis for item in items])
+        confidence_values = [item.confidence for item in items if item.confidence is not None]
         merged.append(
             RiskItem(
                 id=first.id,
@@ -226,6 +266,9 @@ def merge_risks(risks: list[RiskItem]) -> list[RiskItem]:
                 risk_type=first.risk_type,
                 risk_reason="；".join(reasons),
                 source_basis="；".join(bases),
+                evidence_items=_dedupe_evidence_items([evidence for item in items for evidence in item.evidence_items]),
+                confidence=max(confidence_values) if confidence_values else None,
+                unresolved_questions=_dedupe_text([question for item in items for question in item.unresolved_questions]),
             )
         )
     return merged
@@ -313,6 +356,7 @@ def _extract_with_llm(
     max_chars: int = 14000,
     project_id: str = "",
     human_context: str = "",
+    fact_context: str = "",
 ) -> ExtractionBundle:
     """把某个来源分块交给大模型识别风险物料。"""
 
@@ -325,9 +369,10 @@ def _extract_with_llm(
     material_context = _material_context(materials)
     model_name = get_effective_settings().text_model
     human_context = human_context.strip()
+    fact_context = fact_context.strip()
     for chunk_index, chunk in enumerate(_chunk_lines(clean_lines, max_chars=max_chars), start=1):
-        prompt = _build_prompt(source_name, chunk_index, material_context, chunk, human_context=human_context)
-        chunk_hash = _chunk_hash(source_name, material_context, chunk, human_context=human_context)
+        prompt = _build_prompt(source_name, chunk_index, material_context, chunk, human_context=human_context, fact_context=fact_context)
+        chunk_hash = _chunk_hash(source_name, material_context, chunk, human_context=human_context, fact_context=fact_context)
         cache_hit = True
         data = load_llm_cache(
             project_id=project_id or "no-project",
@@ -364,6 +409,7 @@ def _build_prompt(
     material_context: str,
     source_context: str,
     human_context: str = "",
+    fact_context: str = "",
 ) -> str:
     """生成风险识别提示词。"""
 
@@ -373,6 +419,13 @@ def _build_prompt(
         human_section = f"""
 已处理的人工确认/补充信息：
 {human_context}
+
+"""
+    fact_section = ""
+    if fact_context:
+        fact_section = f"""
+已抽取的产品事实：
+{fact_context}
 
 """
     return f"""你是 IPD 计划阶段的采购风险物料识别 Agent，输出对象只给采购查看。
@@ -387,12 +440,13 @@ def _build_prompt(
 - 优先关联到 BOM 中真实物料名称；确实无法关联时，material_name 可写“待确认物料”；
 - 来源与依据必须能追溯到输入内容，不要编造没有出现的信息。
 - 如果存在“已处理的人工确认/补充信息”，必须把它作为本项目的补充上下文参与判断。
+- 如果存在“已抽取的产品事实”，必须优先引用事实层信息做判断，再回看原文片段。
 - 人工回答中的“不确定、无法确认、待确认、需要后续补充”等表达不能视为风险解除；应保留对应候选风险或生成非阻塞必答问题。
 
 可参考的 BOM 物料清单：
 {material_context}
 
-{human_section}待识别来源内容：
+{fact_section}{human_section}待识别来源内容：
 {source_context}
 
 {RISK_JSON_SCHEMA}
@@ -429,10 +483,10 @@ def _chunk_lines(lines: list[str], max_chars: int) -> list[str]:
     return chunks
 
 
-def _chunk_hash(source_name: str, material_context: str, chunk: str, human_context: str = "") -> str:
+def _chunk_hash(source_name: str, material_context: str, chunk: str, human_context: str = "", fact_context: str = "") -> str:
     """计算模型输入分块 hash，用于 LLM 输出缓存。"""
 
-    payload = "\n".join([PROMPT_VERSION, source_name, material_context, human_context.strip(), chunk])
+    payload = "\n".join([PROMPT_VERSION, source_name, material_context, fact_context.strip(), human_context.strip(), chunk])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -471,6 +525,11 @@ def _items_and_questions_from_model(
                 risk_type=risk_type,
                 risk_reason=risk_reason,
                 source_basis=source_basis if source_name in source_basis else f"{source_name}：{source_basis}",
+                evidence_items=_evidence_items_from_model(row.get("evidence_items")),
+                confidence=_confidence_from_model(row.get("confidence")),
+                unresolved_questions=[str(item).strip() for item in row.get("unresolved_questions", []) if str(item).strip()]
+                if isinstance(row.get("unresolved_questions"), list)
+                else [],
             )
         )
     return risks, _questions_from_model(raw_questions, source_name)
@@ -553,6 +612,50 @@ def _module_for_material(material_name: str, materials: list[MaterialRecord]) ->
     return ""
 
 
+def _evidence_items_from_model(raw_items: Any) -> list[DocumentSourceRef]:
+    """转换模型返回的结构化证据。"""
+
+    if not isinstance(raw_items, list):
+        return []
+    items: list[DocumentSourceRef] = []
+    for row in raw_items:
+        if not isinstance(row, dict):
+            continue
+        items.append(
+            DocumentSourceRef(
+                source_name=str(row.get("source_name") or "").strip(),
+                file_name=str(row.get("file_name") or "").strip(),
+                sheet=str(row.get("sheet") or "").strip(),
+                row_number=_as_int(row.get("row_number")),
+                page_number=_as_int(row.get("page_number")),
+                parser=str(row.get("parser") or "").strip(),
+                excerpt=str(row.get("excerpt") or "").strip(),
+            )
+        )
+    return items
+
+
+def _confidence_from_model(value: Any) -> float | None:
+    """把模型置信度转成 0-1 范围。"""
+
+    if value in [None, ""]:
+        return None
+    try:
+        score = float(value)
+    except Exception:
+        return None
+    return max(0.0, min(1.0, score))
+
+
+def _as_int(value: Any) -> int:
+    """安全转 int。"""
+
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
 def _dedupe_text(values: list[str]) -> list[str]:
     """保序去重，并丢弃空文本。"""
 
@@ -563,4 +666,25 @@ def _dedupe_text(values: list[str]) -> list[str]:
         if text and text not in seen:
             result.append(text)
             seen.add(text)
+    return result
+
+
+def _dedupe_evidence_items(values: list[DocumentSourceRef]) -> list[DocumentSourceRef]:
+    """保序去重结构化证据。"""
+
+    result: list[DocumentSourceRef] = []
+    seen: set[tuple[str, str, str, int, int, str, str]] = set()
+    for value in values:
+        key = (
+            value.source_name,
+            value.file_name,
+            value.sheet,
+            value.row_number,
+            value.page_number,
+            value.parser,
+            value.excerpt,
+        )
+        if value.excerpt.strip() and key not in seen:
+            result.append(value)
+            seen.add(key)
     return result

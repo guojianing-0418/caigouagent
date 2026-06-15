@@ -7,4 +7,5 @@ drawing_dir:
 rd_risk_path:
 lark_chat:
 expected_path: evals/cases/p725/expected_risks.json
+expected_facts_path: evals/cases/p725/expected_facts.json
 mock_output_path: evals/cases/p725/mock_model_output.json

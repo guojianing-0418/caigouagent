@@ -188,6 +188,10 @@ def _threshold_check(report: dict[str, Any]) -> dict[str, Any]:
             failures.append(f"{section}.status={report[section].get('status')}")
     if report["ingestion"].get("suspicious_title_only"):
         failures.append("ingestion.suspicious_title_only is true")
+    if not report["ingestion"].get("dimension_repair_message_ok", True):
+        failures.append("ingestion.dimension_repair_message_ok is not true")
+    if report["question_lifecycle"].get("business_choice_boolean_compat") is not True:
+        failures.append("question_lifecycle.business_choice_boolean_compat is not true")
     return {
         "status": "failed" if failures else "ok",
         "failures": failures,
@@ -421,6 +425,24 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
         blocking=False,
     )
     upsert_result = _upsert_questions(state, [refreshed, ignored_answered, new_question])
+    business_choice = create_question(
+        question_kind="procurement_confirmation",
+        input_type="boolean",
+        title="应变片供应商是否已定点？",
+        options=["已定点", "未定点，有候选", "未定点，需寻找"],
+        required=True,
+        blocking=False,
+    )
+    answer_question(business_choice, "未定点，有候选")
+    keep_question = create_question(
+        question_kind="risk_keep_review",
+        input_type="boolean",
+        title="是否保留风险？",
+        options=["保留", "删除"],
+        required=False,
+        blocking=False,
+    )
+    answer_question(keep_question, "删除")
     state.risks = [
         RiskItem(
             id="new-risk",
@@ -440,6 +462,8 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
         "new_question_added": any(question.title == "确认接口件对应物料" for question in state.questions),
         "upsert_counts_ok": len(upsert_result["added"]) == 1 and len(upsert_result["refreshed"]) == 1 and len(upsert_result["ignored"]) == 1,
         "stale_risk_question_removed": removed_count == 1 and all("stale-risk" not in question.related_risk_ids for question in state.questions),
+        "business_choice_boolean_compat": business_choice.input_type == "single_select" and business_choice.answer == "未定点，有候选",
+        "real_boolean_still_boolean": keep_question.input_type == "boolean" and keep_question.answer is False,
     }
     return {
         "status": "ok" if all(checks.values()) else "failed",
@@ -577,6 +601,7 @@ def _run_ingestion_checks(case: dict[str, Any]) -> dict[str, Any]:
         "prd_line_count": len(result.lines()),
         "non_empty_cell_count": result.diagnostics.non_empty_cell_count,
         "suspicious_title_only": result.diagnostics.suspicious_title_only,
+        "dimension_repair_message_ok": any("Excel 内部维度元数据异常" in warning and "已自动重置读取范围" in warning for warning in result.diagnostics.warnings),
         "warnings": result.diagnostics.warnings,
     }
 

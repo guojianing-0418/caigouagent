@@ -155,6 +155,34 @@ QuestionStatus = Literal["pending", "answered", "skipped", "rejected"]
 QuestionAction = Literal["submit", "skip", "reject"]
 
 
+def normalize_question_input_type(input_type: Any, options: list[Any] | None = None) -> str:
+    """修正模型偶发的“boolean + 多业务选项”问题类型。"""
+
+    normalized = str(input_type or "single_select").strip()
+    if normalized != "boolean":
+        return normalized
+    option_values = [str(option).strip() for option in (options or []) if str(option).strip()]
+    if not option_values:
+        return "boolean"
+    if len(option_values) != 2:
+        return "single_select"
+    parsed = {_boolean_option_value(option) for option in option_values}
+    return "boolean" if parsed == {True, False} else "single_select"
+
+
+def _boolean_option_value(value: str) -> bool | None:
+    """识别真正的是/否类按钮，避免把业务状态误判成 boolean。"""
+
+    text = value.strip().lower()
+    positive = {"是", "确认", "保留", "合并", "通过", "true", "yes", "y", "1", "allow"}
+    negative = {"否", "不", "删除", "不合并", "不保留", "驳回", "false", "no", "n", "0", "deny"}
+    if text in positive or value in positive:
+        return True
+    if text in negative or value in negative:
+        return False
+    return None
+
+
 class Question(BaseModel):
     """Agent 执行中产生的结构化问题。
 
@@ -224,6 +252,7 @@ class Question(BaseModel):
         data.setdefault("message", data.get("title", ""))
         data.setdefault("context", {})
         data.setdefault("allow_custom", True)
+        data["input_type"] = normalize_question_input_type(data.get("input_type"), data.get("options"))
         return data
 
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .models import ProjectState, Question, QuestionAction, QuestionInputType, QuestionPermission
+from .models import ProjectState, Question, QuestionAction, QuestionInputType, QuestionPermission, normalize_question_input_type
 
 
 VALID_INPUT_TYPES = {"single_select", "multi_select", "boolean", "text", "textarea"}
@@ -39,6 +39,8 @@ def create_question(
 ) -> Question:
     """创建一个通用 Question，并做最基础的字段校验。"""
 
+    normalized_options = [str(option).strip() for option in (options or []) if str(option).strip()]
+    input_type = normalize_question_input_type(input_type, normalized_options)  # type: ignore[assignment]
     if input_type not in VALID_INPUT_TYPES:
         raise ValueError(f"不支持的问题输入类型：{input_type}")
     if permission not in VALID_PERMISSIONS:
@@ -50,7 +52,7 @@ def create_question(
         title=title.strip() or "需要人工确认",
         message=(message or title).strip(),
         reason=reason.strip(),
-        options=[str(option).strip() for option in (options or []) if str(option).strip()],
+        options=normalized_options,
         default_value=default_value,
         blocking=blocking,
         required=required,
@@ -216,6 +218,15 @@ def _validate_and_normalize_answer(question: Question, answer: Any) -> Any:
         return values
 
     if question.input_type == "boolean":
+        normalized_type = normalize_question_input_type(question.input_type, question.options)
+        if normalized_type == "single_select":
+            value = _as_text(answer)
+            if question.required and not value:
+                raise ValueError("请选择或填写一个答案。")
+            if value and question.options and not question.allow_custom and value not in question.options:
+                raise ValueError("答案不在允许选项中。")
+            question.input_type = "single_select"
+            return value
         if isinstance(answer, bool):
             return answer
         value = _as_text(answer)

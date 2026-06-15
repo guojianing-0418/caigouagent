@@ -212,10 +212,12 @@ def answer_question(project_id: str, question_id: str, payload: AnswerRequest, b
 
     try:
         record_question_answer(question, payload.answer, payload.action)
-        apply_question_effect(state, question)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    state = _merge_answer_into_latest_state(project_id, state, question)
+    question = next((q for q in state.questions if q.id == question_id), question)
+    apply_question_effect(state, question)
     append_log(state, f"已处理人工确认问题：{question.title}。")
     if _should_auto_rerun_after_answer(state, question, payload.action):
         _schedule_rerun_after_answer(state, background_tasks)
@@ -324,6 +326,21 @@ def _refresh_status_after_question_answer(state: ProjectState) -> None:
         else:
             state.status = "created"
             state.current_step = "人工确认已完成，可继续运行"
+
+
+def _merge_answer_into_latest_state(project_id: str, state: ProjectState, answered_question: Question) -> ProjectState:
+    """把答案合并到磁盘上的最新项目状态，降低后台任务旧 state 覆盖答案的概率。"""
+
+    latest = load_project(project_id)
+    if latest.updated_at == state.updated_at:
+        return state
+    for index, question in enumerate(latest.questions):
+        if question.id == answered_question.id:
+            latest.questions[index] = answered_question
+            break
+    else:
+        latest.questions.append(answered_question)
+    return latest
 
 
 def _should_auto_rerun_after_answer(state: ProjectState, question: Question, action: str) -> bool:

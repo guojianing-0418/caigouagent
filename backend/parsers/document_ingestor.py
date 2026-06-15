@@ -120,7 +120,14 @@ def _repair_read_only_dimensions(ws, warnings: list[str]) -> None:
         return
     if dimension == "A1:A1":
         ws.reset_dimensions()
-        warnings.append(f"工作表“{ws.title}”声明维度为 A1:A1，已重置维度后读取。")
+        try:
+            repaired_dimension = ws.calculate_dimension(force=True)
+        except Exception:
+            repaired_dimension = "未知范围"
+        warnings.append(
+            f"工作表“{ws.title}”的 Excel 内部维度元数据异常（声明为 A1:A1），"
+            f"已自动重置读取范围为 {repaired_dimension}。"
+        )
 
 
 def _ingest_text(path: Path, source_name: str, max_units: int) -> DocumentIngestionResult:

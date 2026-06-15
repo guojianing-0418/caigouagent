@@ -26,7 +26,7 @@ from .risk_rules import (
     merge_risks,
 )
 from .question_engine import active_question, build_human_answer_context
-from .storage import append_log, save_lark_messages, save_project
+from .storage import append_log, load_project, save_lark_messages, save_project
 
 
 class AgentState(TypedDict, total=False):
@@ -282,6 +282,7 @@ class QuestionUpsertResult(TypedDict):
 def _upsert_questions(project: ProjectState, questions: list[Question]) -> QuestionUpsertResult:
     """按问题签名新增或刷新 pending 问题，避免重跑后重复或丢失。"""
 
+    _sync_completed_questions_from_latest(project)
     answered_signatures = {
         _question_signature(question)
         for question in project.questions
@@ -309,6 +310,30 @@ def _upsert_questions(project: ProjectState, questions: list[Question]) -> Quest
         pending_by_signature[signature] = question
         added.append(question)
     return {"added": added, "refreshed": refreshed, "ignored": ignored}
+
+
+def _sync_completed_questions_from_latest(project: ProjectState) -> None:
+    """同步运行期间已提交的人工答案，避免后台旧 state 覆盖用户操作。"""
+
+    try:
+        latest = load_project(project.id)
+    except FileNotFoundError:
+        return
+    completed_by_id = {
+        question.id: question
+        for question in latest.questions
+        if question.status in {"answered", "skipped", "rejected"}
+    }
+    if not completed_by_id:
+        return
+    existing_ids = {question.id for question in project.questions}
+    for index, question in enumerate(project.questions):
+        completed = completed_by_id.get(question.id)
+        if completed:
+            project.questions[index] = completed
+    for question_id, completed in completed_by_id.items():
+        if question_id not in existing_ids:
+            project.questions.append(completed)
 
 
 def _refresh_pending_question(existing: Question, incoming: Question) -> None:

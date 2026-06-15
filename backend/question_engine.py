@@ -149,6 +149,51 @@ def pending_required_questions(state: ProjectState) -> list[Question]:
     return [question for question in state.questions if question.status == "pending" and question.required]
 
 
+def build_human_answer_context(state: ProjectState, max_questions: int = 40, max_chars: int = 8000) -> str:
+    """把已处理的人工确认问题整理成可回流给大模型的上下文。
+
+    人工答案不是普通日志。Agent resume 后，后续模型调用必须看到这些答案，
+    才能真正按用户补充的信息继续识别风险。
+    """
+
+    completed = [question for question in state.questions if question.status in {"answered", "skipped", "rejected"}]
+    if not completed:
+        return ""
+
+    selected = completed[-max_questions:]
+    lines = [
+        "以下是本项目已处理的人工确认/补充信息，后续风险识别必须参考。",
+        "如果人工回答表达“不确定、无法确认、待确认”，不要把它当成已确认事实；应保留相应未决风险。",
+    ]
+    omitted_count = len(completed) - len(selected)
+    if omitted_count > 0:
+        lines.append(f"前面还有 {omitted_count} 条较早的人工确认已省略，仅保留最近 {len(selected)} 条。")
+
+    for index, question in enumerate(selected, start=1):
+        source_name = str(question.context.get("source_name") or "").strip()
+        source_excerpt = str(question.context.get("source_excerpt") or "").strip()
+        status_label = _question_status_label(question.status)
+        lines.append(f"{index}. [{status_label}] {question.title}")
+        lines.append(f"   分类: {question.question_kind}" + (f"；来源: {source_name}" if source_name else ""))
+        if question.message:
+            lines.append(f"   原问题: {_clip_text(question.message, 500)}")
+        if question.reason:
+            lines.append(f"   提问原因: {_clip_text(question.reason, 400)}")
+        if source_excerpt:
+            lines.append(f"   原始依据: {_clip_text(source_excerpt, 500)}")
+        if question.status == "answered":
+            lines.append(f"   人工回答: {_clip_text(_answer_to_text(question.answer), 800)}")
+        elif question.status == "skipped":
+            lines.append("   人工处理: 已跳过；不能视为已确认事实。")
+        else:
+            lines.append(f"   人工处理: 已拒绝/驳回；反馈: {_clip_text(_answer_to_text(question.answer), 800)}")
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip() + "\n...（人工确认上下文过长，已截断）"
+    return text
+
+
 def _validate_and_normalize_answer(question: Question, answer: Any) -> Any:
     """按控件类型校验答案，并返回便于后端处理的值。"""
 
@@ -273,6 +318,35 @@ def _as_list(value: Any) -> list[str]:
     if value is None:
         return []
     return [item.strip() for item in re.split(r"[,，;；\n]+", str(value)) if item.strip()]
+
+
+def _answer_to_text(answer: Any) -> str:
+    """把人工答案转成适合放进模型上下文的文本。"""
+
+    if isinstance(answer, list):
+        return "；".join(str(item).strip() for item in answer if str(item).strip())
+    if isinstance(answer, bool):
+        return "是" if answer else "否"
+    return _as_text(answer) or "（空）"
+
+
+def _question_status_label(status: str) -> str:
+    """把问题状态转成给模型看的中文标签。"""
+
+    return {
+        "answered": "已回答",
+        "skipped": "已跳过",
+        "rejected": "已拒绝",
+    }.get(status, status)
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """限制单条上下文长度，避免人工回答把提示词撑爆。"""
+
+    clean = " ".join(str(text).split())
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit].rstrip() + "..."
 
 
 def _dedupe_text(values: list[str]) -> list[str]:

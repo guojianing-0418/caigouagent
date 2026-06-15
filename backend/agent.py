@@ -24,7 +24,7 @@ from .risk_rules import (
     extract_rd_risks,
     merge_risks,
 )
-from .question_engine import active_question
+from .question_engine import active_question, build_human_answer_context
 from .storage import append_log, save_lark_messages, save_project
 
 
@@ -173,14 +173,17 @@ def _node_extract_risks(state: AgentState) -> AgentState:
 
     risks: list[RiskItem] = []
     generated_questions: list[Question] = []
+    human_context = build_human_answer_context(project)
+    if human_context:
+        append_log(project, "已加载人工确认上下文，后续模型识别会参考已提交答案。")
     # 按来源顺序抽取；若某个来源产生阻塞问题，立即暂停，等待采购回答。
     extractors = [
-        lambda: extract_bom_risks(materials, project.id),
-        lambda: extract_document_risks(project.__dict__.get("_prd_lines", []), materials, "PRD", project.id),
-        lambda: extract_document_risks(project.__dict__.get("_spec_lines", []), materials, "规格书", project.id),
-        lambda: extract_document_risks(project.__dict__.get("_drawing_lines", []), materials, "PDF图纸", project.id),
-        lambda: extract_rd_risks(project.__dict__.get("_rd_records", []), materials, project.id),
-        lambda: extract_lark_risks(project.__dict__.get("_lark_messages", []), materials, project.id),
+        lambda: extract_bom_risks(materials, project.id, human_context=human_context),
+        lambda: extract_document_risks(project.__dict__.get("_prd_lines", []), materials, "PRD", project.id, human_context=human_context),
+        lambda: extract_document_risks(project.__dict__.get("_spec_lines", []), materials, "规格书", project.id, human_context=human_context),
+        lambda: extract_document_risks(project.__dict__.get("_drawing_lines", []), materials, "PDF图纸", project.id, human_context=human_context),
+        lambda: extract_rd_risks(project.__dict__.get("_rd_records", []), materials, project.id, human_context=human_context),
+        lambda: extract_lark_risks(project.__dict__.get("_lark_messages", []), materials, project.id, human_context=human_context),
     ]
     for extractor in extractors:
         source_risks, source_questions = extractor()

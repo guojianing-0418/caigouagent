@@ -21,7 +21,7 @@ from .question_engine import create_question
 from .storage import load_llm_cache, save_llm_cache
 
 
-PROMPT_VERSION = "plan-risk-v2-structured-cache"
+PROMPT_VERSION = "plan-risk-v3-human-answer-context"
 
 
 RISK_OUTPUT_JSON_SCHEMA = {
@@ -152,7 +152,7 @@ def normalize_name(name: str) -> str:
 ExtractionBundle = tuple[list[RiskItem], list[Question]]
 
 
-def extract_bom_risks(materials: list[MaterialRecord], project_id: str = "") -> ExtractionBundle:
+def extract_bom_risks(materials: list[MaterialRecord], project_id: str = "", human_context: str = "") -> ExtractionBundle:
     """用大模型从 BOM 识别计划阶段采购风险物料。"""
 
     lines = [
@@ -160,26 +160,42 @@ def extract_bom_risks(materials: list[MaterialRecord], project_id: str = "") -> 
         f"name={item.name}; spec={item.spec}; material={item.material}; quantity={item.quantity}"
         for item in materials
     ]
-    return _extract_with_llm("草 BOM", lines, materials, project_id=project_id)
+    return _extract_with_llm("草 BOM", lines, materials, project_id=project_id, human_context=human_context)
 
 
-def extract_document_risks(lines: list[str], materials: list[MaterialRecord], source_name: str, project_id: str = "") -> ExtractionBundle:
+def extract_document_risks(
+    lines: list[str],
+    materials: list[MaterialRecord],
+    source_name: str,
+    project_id: str = "",
+    human_context: str = "",
+) -> ExtractionBundle:
     """用大模型从 PRD、规格书或 PDF 图纸线索中识别风险物料。"""
 
-    return _extract_with_llm(source_name, lines, materials, project_id=project_id)
+    return _extract_with_llm(source_name, lines, materials, project_id=project_id, human_context=human_context)
 
 
-def extract_rd_risks(records: list[dict[str, str]], materials: list[MaterialRecord], project_id: str = "") -> ExtractionBundle:
+def extract_rd_risks(
+    records: list[dict[str, str]],
+    materials: list[MaterialRecord],
+    project_id: str = "",
+    human_context: str = "",
+) -> ExtractionBundle:
     """用大模型理解研发自提风险并归入统一输出结构。"""
 
     lines = [
         f"sheet={record.get('sheet', '')}; 风险物料名称={record.get('material_name', '')}; 原因={record.get('reason', '')}"
         for record in records
     ]
-    return _extract_with_llm("研发自提风险", lines, materials, project_id=project_id)
+    return _extract_with_llm("研发自提风险", lines, materials, project_id=project_id, human_context=human_context)
 
 
-def extract_lark_risks(messages: list[LarkMessage], materials: list[MaterialRecord], project_id: str = "") -> ExtractionBundle:
+def extract_lark_risks(
+    messages: list[LarkMessage],
+    materials: list[MaterialRecord],
+    project_id: str = "",
+    human_context: str = "",
+) -> ExtractionBundle:
     """用大模型从飞书群历史消息中识别风险物料。"""
 
     lines = [
@@ -187,7 +203,7 @@ def extract_lark_risks(messages: list[LarkMessage], materials: list[MaterialReco
         for msg in messages
         if msg.content.strip()
     ]
-    return _extract_with_llm("飞书项目群历史消息", lines, materials, max_chars=10000, project_id=project_id)
+    return _extract_with_llm("飞书项目群历史消息", lines, materials, max_chars=10000, project_id=project_id, human_context=human_context)
 
 
 def merge_risks(risks: list[RiskItem]) -> list[RiskItem]:
@@ -296,6 +312,7 @@ def _extract_with_llm(
     materials: list[MaterialRecord],
     max_chars: int = 14000,
     project_id: str = "",
+    human_context: str = "",
 ) -> ExtractionBundle:
     """把某个来源分块交给大模型识别风险物料。"""
 
@@ -307,9 +324,10 @@ def _extract_with_llm(
     questions: list[Question] = []
     material_context = _material_context(materials)
     model_name = get_effective_settings().text_model
+    human_context = human_context.strip()
     for chunk_index, chunk in enumerate(_chunk_lines(clean_lines, max_chars=max_chars), start=1):
-        prompt = _build_prompt(source_name, chunk_index, material_context, chunk)
-        chunk_hash = _chunk_hash(source_name, material_context, chunk)
+        prompt = _build_prompt(source_name, chunk_index, material_context, chunk, human_context=human_context)
+        chunk_hash = _chunk_hash(source_name, material_context, chunk, human_context=human_context)
         cache_hit = True
         data = load_llm_cache(
             project_id=project_id or "no-project",
@@ -340,10 +358,23 @@ def _extract_with_llm(
     return risks, questions
 
 
-def _build_prompt(source_name: str, chunk_index: int, material_context: str, source_context: str) -> str:
+def _build_prompt(
+    source_name: str,
+    chunk_index: int,
+    material_context: str,
+    source_context: str,
+    human_context: str = "",
+) -> str:
     """生成风险识别提示词。"""
 
     risk_types = "、".join(RISK_TYPES)
+    human_section = ""
+    if human_context:
+        human_section = f"""
+已处理的人工确认/补充信息：
+{human_context}
+
+"""
     return f"""你是 IPD 计划阶段的采购风险物料识别 Agent，输出对象只给采购查看。
 
 请基于【{source_name}】第 {chunk_index} 段内容，识别计划阶段需要采购提前关注的风险物料。
@@ -355,11 +386,13 @@ def _build_prompt(source_name: str, chunk_index: int, material_context: str, sou
 - 风险类型只能从以下 8 类选择：{risk_types}；
 - 优先关联到 BOM 中真实物料名称；确实无法关联时，material_name 可写“待确认物料”；
 - 来源与依据必须能追溯到输入内容，不要编造没有出现的信息。
+- 如果存在“已处理的人工确认/补充信息”，必须把它作为本项目的补充上下文参与判断。
+- 人工回答中的“不确定、无法确认、待确认、需要后续补充”等表达不能视为风险解除；应保留对应候选风险或生成非阻塞必答问题。
 
 可参考的 BOM 物料清单：
 {material_context}
 
-待识别来源内容：
+{human_section}待识别来源内容：
 {source_context}
 
 {RISK_JSON_SCHEMA}
@@ -396,10 +429,10 @@ def _chunk_lines(lines: list[str], max_chars: int) -> list[str]:
     return chunks
 
 
-def _chunk_hash(source_name: str, material_context: str, chunk: str) -> str:
+def _chunk_hash(source_name: str, material_context: str, chunk: str, human_context: str = "") -> str:
     """计算模型输入分块 hash，用于 LLM 输出缓存。"""
 
-    payload = "\n".join([PROMPT_VERSION, source_name, material_context, chunk])
+    payload = "\n".join([PROMPT_VERSION, source_name, material_context, human_context.strip(), chunk])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

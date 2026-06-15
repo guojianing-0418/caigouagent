@@ -26,6 +26,7 @@ def read_sheet_rows(path: str | Path) -> dict[str, list[list[str]]]:
     wb = load_workbook(path, data_only=True, read_only=True)
     result: dict[str, list[list[str]]] = {}
     for ws in wb.worksheets:
+        _repair_read_only_dimensions(ws)
         rows: list[list[str]] = []
         for row in ws.iter_rows(values_only=True):
             values = [cell_text(v) for v in row]
@@ -33,6 +34,19 @@ def read_sheet_rows(path: str | Path) -> dict[str, list[list[str]]]:
                 rows.append(values)
         result[ws.title] = rows
     return result
+
+
+def _repair_read_only_dimensions(ws: Any) -> None:
+    """修复部分 Excel 文件在只读模式下错误声明为 A1:A1 的维度。"""
+
+    if not hasattr(ws, "reset_dimensions"):
+        return
+    try:
+        dimension = ws.calculate_dimension()
+    except Exception:
+        return
+    if dimension == "A1:A1":
+        ws.reset_dimensions()
 
 
 def find_header_index(rows: list[list[str]], required_keyword: str) -> int:

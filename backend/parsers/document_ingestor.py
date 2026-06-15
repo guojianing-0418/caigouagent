@@ -7,11 +7,28 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from openpyxl import load_workbook
 
 from ..models import DocumentIngestionDiagnostics, DocumentIngestionResult, DocumentTextUnit
 from .excel_utils import cell_text
+
+
+DocumentParser = Callable[[Path, str, int], DocumentIngestionResult]
+EXPERIMENTAL_PARSERS: dict[str, DocumentParser] = {}
+
+
+def register_experimental_parser(suffix: str, parser: DocumentParser) -> None:
+    """注册可选实验解析器，供 MarkItDown / Docling / Unstructured 等分支接入。
+
+    默认部署不注册任何实验解析器，也不引入额外依赖。
+    """
+
+    normalized = suffix.lower()
+    if not normalized.startswith("."):
+        normalized = f".{normalized}"
+    EXPERIMENTAL_PARSERS[normalized] = parser
 
 
 def ingest_document(path: str | Path | None, source_name: str = "文档", max_units: int = 800) -> DocumentIngestionResult:
@@ -31,6 +48,8 @@ def ingest_document(path: str | Path | None, source_name: str = "文档", max_un
         )
 
     suffix = file_path.suffix.lower()
+    if suffix in EXPERIMENTAL_PARSERS:
+        return EXPERIMENTAL_PARSERS[suffix](file_path, source_name, max_units)
     if suffix in {".xlsx", ".xlsm"}:
         return _ingest_excel(file_path, source_name=source_name, max_units=max_units)
     if suffix in {".txt", ".md", ".csv"}:

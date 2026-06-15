@@ -5,18 +5,19 @@
 ## 功能范围
 
 - 读取草 BOM Excel，解析模块、物料、规格、材质和层级，并交给大模型识别风险。
-- 读取 PRD / 规格书，抽取文本线索，并交给大模型识别性能、成本、可靠性、接口和工艺相关风险。
+- 通过统一 `DocumentIngestor` 读取 PRD / 规格书 / PDF / TXT / MD / CSV，抽取带文件、sheet、行号、页码和解析器信息的文本线索。
+- 从 PRD / 规格书中抽取 `FactItem` 产品事实，再交给风险识别引用。
 - 读取 PDF 图纸文件，支持整页视觉识别。
 - 读取研发自提风险 Excel，模板只有两列：`风险物料名称`、`原因`。
 - 通过 `lark-cli` 读取飞书项目群历史消息。
 - WebUI 支持配置 OpenAI 兼容 `Base URL`、`API Key`、文本模型和视觉模型。
 - WebUI 支持历史记录入口，可查看之前创建过的项目、风险结果和导出文件。
-- 人工确认采用通用 Question Engine：阻塞问题会弹窗暂停 Agent，非阻塞问题进入“人工确认”面板。
+- 人工确认采用通用 Question Engine：阻塞问题会弹窗暂停 Agent，非阻塞问题进入“人工确认”面板；非阻塞必答问题回答后会自动重新识别以应用人工回答。
 - 风险识别优先使用 OpenAI 兼容 Structured Outputs；不支持时自动回退到 JSON prompt。
 - 同一项目的模型分块输出会缓存到 SQLite，重跑或继续运行时尽量复用。
 - 下载正式 Excel 前会检查未处理的必答问题，避免跳过关键采购确认。
 - 未配置或未连通大模型时，系统不会执行风险物料识别，也不会输出规则兜底结果。
-- 输出 Excel 字段固定为：`风险物料名称`、`所属模块`、`风险类型`、`风险原因`、`来源与依据`。
+- 输出 Excel 主表字段固定为：`风险物料名称`、`所属模块`、`风险类型`、`风险原因`、`来源与依据`；第二个 sheet `证据详情` 导出结构化证据、置信度和待确认点。
 
 ## 目录结构
 
@@ -121,6 +122,12 @@ lark-cli auth login --scope "im:chat:read im:message:readonly"
 - `permission`：保留 `allow / ask / deny` 语义；首版主要使用 `ask`。
 - `context`：保存来源摘要、相关物料、风险 ID、轻量后续动作等上下文。
 
+问题生命周期：
+
+- 已回答、已跳过、已拒绝的问题会作为人工上下文保留，后续模型调用必须参考。
+- 重跑时未回答的 pending 问题不会被直接清掉；新生成的同类问题会刷新旧问题，避免重复卡片。
+- 风险保留 / 风险合并类问题如果关联的风险已经不存在，会自动清理。
+
 问题接口：
 
 ```text
@@ -146,6 +153,8 @@ GET  /api/projects/{id}/export/check
 - 模型输出缓存保存在 `data/cache/risk_agent.sqlite3` 的 `llm_cache` 表中，缓存 key 包含项目、来源、分块 hash、模型名和 prompt 版本。
 - Structured Outputs 不可用时，系统自动回退到普通 JSON 调用，并继续执行后端字段校验。
 - 正式导出接口会阻止未处理 `required=true` 问题的项目下载 Excel；前端会先调用 `/export/check` 给出提示。
+- 项目运行中或自动重新识别中，正式导出会被暂时阻止，避免下载旧结果。
+- `backend/parsers/document_ingestor.py` 保留实验解析器注册入口，可在实验分支接入 MarkItDown / Docling / Unstructured；默认部署不依赖这些库。
 
 ## 评测
 
@@ -157,13 +166,26 @@ GET  /api/projects/{id}/export/check
 python evals/run_eval.py --case evals/cases/p725/case.yaml --mode mock
 ```
 
+批量运行所有 case：
+
+```bash
+python evals/run_eval.py --case-dir evals/cases --mode mock
+```
+
 调用真实模型的 live 评测：
 
 ```bash
 python evals/run_eval.py --case evals/cases/p725/case.yaml --mode live
 ```
 
-评测报告会输出到 `evals/reports/`，包含召回率、误报数、风险类型准确率和证据命中率。`expected_risks.json` 是人工期望清单，后续每个项目都可以按同样结构增加样本。
+评测报告会输出到 `evals/reports/`，包含召回率、误报数、风险类型准确率、证据命中率、结构化证据覆盖率、事实命中率、事实来源覆盖率、导出检查、自动重跑检查和问题生命周期检查。`expected_risks.json` 是人工期望风险清单，`expected_facts.json` 是人工期望事实清单，后续每个项目都可以按同样结构增加样本。mock 模式会做阈值检查，关键指标不达标时以非 0 退出。
+
+本地生成物不纳入提交：
+
+- `backend-fastapi*.log`
+- `frontend-vite*.log`
+- `data/templates/研发自提风险模板.xlsx`
+- `evals/reports/`
 
 ## 研发自提风险模板
 

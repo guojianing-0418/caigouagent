@@ -5,21 +5,60 @@
       "module": "功率模块",
       "risk_type": "关键性能风险",
       "risk_reason": "功率模组涉及功率测量精度和校准一致性，计划阶段需要采购提前确认供应能力。",
-      "source_basis": "mock：PRD 提到功率测量精度和校准要求。"
+      "source_basis": "mock：PRD 提到功率测量精度和校准要求。",
+      "evidence_items": [
+        {
+          "source_name": "PRD",
+          "file_name": "P725功率计PRD V1.xlsx",
+          "sheet": "产品需求",
+          "row_number": 38,
+          "page_number": 0,
+          "parser": "openpyxl",
+          "excerpt": "功率测量精度 ±1.0%，需要进行校准一致性验证。"
+        }
+      ],
+      "confidence": 0.86,
+      "unresolved_questions": ["供应商是否已有稳定校准和量产一致性能力？"]
     },
     {
       "material_name": "P725PRO轴心-左侧",
       "module": "踏板模块",
       "risk_type": "定制工艺风险",
       "risk_reason": "轴心零件存在定制加工、公差和装配匹配要求，可能影响周期和良率。",
-      "source_basis": "mock：BOM 中存在轴心零件，结构件加工和公差需关注。"
+      "source_basis": "mock：BOM 中存在轴心零件，结构件加工和公差需关注。",
+      "evidence_items": [
+        {
+          "source_name": "BOM",
+          "file_name": "P725脚踏功率计 结构EBOM.xlsx",
+          "sheet": "EBOM",
+          "row_number": 24,
+          "page_number": 0,
+          "parser": "openpyxl",
+          "excerpt": "P725PRO轴心-左侧为轴心定制加工件，涉及加工、公差和装配匹配。"
+        }
+      ],
+      "confidence": 0.78,
+      "unresolved_questions": ["轴心加工公差和热处理要求是否已冻结？"]
     },
     {
       "material_name": "待确认物料",
       "module": "",
       "risk_type": "接口匹配风险",
       "risk_reason": "群聊中提到接口件匹配问题，但无法确认对应 BOM 物料。",
-      "source_basis": "mock：飞书群消息提到接口件需确认。"
+      "source_basis": "mock：飞书群消息提到接口件需确认。",
+      "evidence_items": [
+        {
+          "source_name": "飞书项目群历史消息",
+          "file_name": "",
+          "sheet": "",
+          "row_number": 0,
+          "page_number": 0,
+          "parser": "lark",
+          "excerpt": "接口件匹配问题需要确认对应 BOM 物料。"
+        }
+      ],
+      "confidence": 0.52,
+      "unresolved_questions": ["接口件对应哪个 BOM 物料？"]
     }
   ],
   "questions": [

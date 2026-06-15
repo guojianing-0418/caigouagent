@@ -1,11 +1,14 @@
 __pycache__/
 *.pyc
 .env
+backend-fastapi*.log
+frontend-vite*.log
 data/uploads/
 data/exports/
 data/cache/
 data/projects/
 data/config/
+data/templates/
 frontend/node_modules/
 frontend/dist/
 evals/reports/

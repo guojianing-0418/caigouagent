@@ -241,7 +241,7 @@ function App() {
       }
       await refreshProject(project.id);
       await loadHistory();
-      setNotice(question.blocking ? "确认结果已保存，Agent 已继续运行。" : "确认结果已保存。");
+      setNotice(answerNoticeForQuestion(question, action, data));
     } catch (err) {
       setError(err.message);
     } finally {
@@ -730,6 +730,14 @@ function questionClassName(question, blocking) {
   if (blocking || question.blocking) return "blocking";
   if (question.required) return "required";
   return "optional";
+}
+
+function answerNoticeForQuestion(question, action, projectState) {
+  if (question.blocking) return "确认结果已保存，Agent 已继续运行。";
+  if (action === "submit" && question.required && projectState?.status === "running") {
+    return "确认结果已保存，已开始重新识别。";
+  }
+  return "确认结果已保存。";
 }
 
 function formatConfidence(value) {

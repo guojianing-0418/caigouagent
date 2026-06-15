@@ -25,6 +25,8 @@ sys.path.insert(0, str(ROOT))
 
 from backend.fact_rules import extract_document_facts, format_facts_for_prompt
 from backend.exporter import EVIDENCE_HEADERS, EXPORT_HEADERS, export_risks
+from backend.agent import _remove_stale_risk_action_questions, _upsert_questions
+from backend.main import _build_export_check, _should_auto_rerun_after_answer
 from backend.models import DocumentSourceRef, FactItem, MaterialRecord, ProjectConfig, ProjectState, Question, RiskItem
 from backend.parsers.bom_parser import parse_bom
 from backend.parsers.document_parser import parse_document_lines
@@ -41,23 +43,65 @@ from backend.risk_rules import (
 )
 
 
+MOCK_THRESHOLDS = {
+    "recall": 1.0,
+    "risk_type_accuracy": 1.0,
+    "evidence_hit_rate": 1.0,
+    "structured_evidence_rate": 1.0,
+    "fact_hit_rate": 1.0,
+    "fact_source_ref_rate": 1.0,
+}
+
+
 def main() -> None:
     """读取评测配置并输出报告。"""
 
     parser = argparse.ArgumentParser(description="运行采购风险 Agent 评测")
-    parser.add_argument("--case", required=True, help="评测 case.yaml 路径")
+    parser.add_argument("--case", help="评测 case.yaml 路径")
+    parser.add_argument("--case-dir", help="批量运行目录下所有 case.yaml")
     parser.add_argument("--mode", choices=["mock", "live"], default="mock", help="mock 不调用模型，live 调用真实模型")
     args = parser.parse_args()
 
-    case_path = Path(args.case)
+    case_paths = _resolve_case_paths(args.case, args.case_dir)
+    reports = []
+    failed = False
+    for case_path in case_paths:
+        report, report_path = _run_case(case_path, args.mode)
+        reports.append((report, report_path))
+        failed = _print_case_summary(report, report_path) or failed
+
+    if len(reports) > 1:
+        _print_batch_summary(reports)
+    if failed:
+        raise SystemExit(1)
+
+
+def _resolve_case_paths(case: str | None, case_dir: str | None) -> list[Path]:
+    """解析单 case 或批量 case 路径。"""
+
+    if bool(case) == bool(case_dir):
+        raise SystemExit("请传入 --case 或 --case-dir，且二者只能选择一个。")
+    if case:
+        return [Path(case)]
+    paths = sorted(Path(case_dir or "").glob("*/case.yaml"))
+    if not paths:
+        raise SystemExit(f"未在目录中找到 case.yaml：{case_dir}")
+    return paths
+
+
+def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
+    """运行单个评测 case。"""
+
     case = yaml.safe_load(case_path.read_text(encoding="utf-8"))
     expected = _load_expected(Path(case["expected_path"]))
     expected_facts = _load_expected_facts(case)
     materials = parse_bom(case["bom_path"])
     ingestion_report = _run_ingestion_checks(case)
     human_context_report = _run_human_context_check()
+    auto_rerun_report = _run_auto_rerun_check()
+    question_lifecycle_report = _run_question_lifecycle_check()
 
-    if args.mode == "mock":
+    if mode == "mock":
         risks, questions, facts = _run_mock(case, materials)
     else:
         risks, questions, facts = _run_live(case, materials)
@@ -65,7 +109,7 @@ def main() -> None:
     export_report = _run_export_check()
     report = _build_report(
         case["case_name"],
-        args.mode,
+        mode,
         risks,
         questions,
         expected,
@@ -74,22 +118,81 @@ def main() -> None:
         ingestion_report,
         human_context_report,
         export_report,
+        auto_rerun_report,
+        question_lifecycle_report,
     )
-    report_path = _write_report(case["case_name"], args.mode, report)
+    report["thresholds"] = _threshold_check(report) if mode == "mock" else {"status": "skipped", "failures": []}
+    report_path = _write_report(case["case_name"], mode, report)
+    return report, report_path
 
-    print(f"case: {case['case_name']}")
-    print(f"mode: {args.mode}")
-    print(f"risks: {len(risks)}")
-    print(f"questions: {len(questions)}")
+
+def _print_case_summary(report: dict[str, Any], report_path: Path) -> bool:
+    """打印单 case 摘要，返回是否失败。"""
+
+    print(f"case: {report['case_name']}")
+    print(f"mode: {report['mode']}")
+    print(f"risks: {report['metrics']['risk_count']}")
+    print(f"questions: {report['metrics']['question_count']}")
     print(f"recall: {report['metrics']['recall']:.2f}")
     print(f"false_positives: {report['metrics']['false_positive_count']}")
     print(f"type_accuracy: {report['metrics']['risk_type_accuracy']:.2f}")
     print(f"evidence_hit_rate: {report['metrics']['evidence_hit_rate']:.2f}")
+    print(f"structured_evidence_rate: {report['metrics']['structured_evidence_rate']:.2f}")
     print(f"fact_hit_rate: {report['metrics']['fact_hit_rate']:.2f}")
+    print(f"fact_source_ref_rate: {report['metrics']['fact_source_ref_rate']:.2f}")
     print(f"prd_line_count: {report['ingestion']['prd_line_count']}")
     print(f"human_context_hash_differs: {report['human_context']['hash_differs']}")
+    print(f"auto_rerun_check: {report['auto_rerun']['status']}")
+    print(f"question_lifecycle_check: {report['question_lifecycle']['status']}")
     print(f"export_check: {report['export_check']['status']}")
+    print(f"thresholds: {report['thresholds']['status']}")
+    for failure in report["thresholds"].get("failures", []):
+        print(f"threshold_failure: {failure}")
     print(f"report: {report_path}")
+    print("")
+    return report["thresholds"]["status"] == "failed"
+
+
+def _print_batch_summary(reports: list[tuple[dict[str, Any], Path]]) -> None:
+    """打印批量评测简洁摘要。"""
+
+    print("batch_summary:")
+    for report, _ in reports:
+        metrics = report["metrics"]
+        print(
+            "- "
+            f"{report['case_name']} "
+            f"recall={metrics['recall']:.2f} "
+            f"fact={metrics['fact_hit_rate']:.2f} "
+            f"evidence={metrics['structured_evidence_rate']:.2f} "
+            f"export={report['export_check']['status']} "
+            f"auto_rerun={report['auto_rerun']['status']} "
+            f"questions={report['question_lifecycle']['status']} "
+            f"thresholds={report['thresholds']['status']}"
+        )
+
+
+def _threshold_check(report: dict[str, Any]) -> dict[str, Any]:
+    """mock 模式下的硬阈值检查。"""
+
+    failures = []
+    metrics = report["metrics"]
+    for key, minimum in MOCK_THRESHOLDS.items():
+        value = float(metrics.get(key, 0))
+        if value < minimum:
+            failures.append(f"{key}={value:.2f} < {minimum:.2f}")
+    if report["human_context"].get("hash_differs") is not True:
+        failures.append("human_context.hash_differs is not true")
+    for section in ["auto_rerun", "question_lifecycle", "export_check"]:
+        if report[section].get("status") != "ok":
+            failures.append(f"{section}.status={report[section].get('status')}")
+    if report["ingestion"].get("suspicious_title_only"):
+        failures.append("ingestion.suspicious_title_only is true")
+    return {
+        "status": "failed" if failures else "ok",
+        "failures": failures,
+        "required_metrics": MOCK_THRESHOLDS,
+    }
 
 
 def _run_mock(case: dict[str, Any], materials: list[MaterialRecord]) -> tuple[list[RiskItem], list[Question], list[FactItem]]:
@@ -181,6 +284,8 @@ def _build_report(
     ingestion_report: dict[str, Any],
     human_context_report: dict[str, Any],
     export_report: dict[str, Any],
+    auto_rerun_report: dict[str, Any],
+    question_lifecycle_report: dict[str, Any],
 ) -> dict[str, Any]:
     """计算召回、误报、类型准确率和证据命中率。"""
 
@@ -209,8 +314,10 @@ def _build_report(
     matched_count = len(matched)
     type_ok_count = sum(1 for match in matched if match["type_ok"])
     evidence_ok_count = sum(1 for match in matched if match["evidence_ok"])
+    structured_evidence_count = sum(1 for risk in risks if _has_structured_evidence(risk))
     fact_matches = _match_expected_facts(expected_facts, facts, ingestion_report)
     fact_hit_count = sum(1 for match in fact_matches if match["matched"])
+    facts_with_source_ref_count = sum(1 for fact in facts if _has_source_ref(fact))
 
     return {
         "case_name": case_name,
@@ -225,18 +332,170 @@ def _build_report(
             "false_positive_count": len(false_positives),
             "risk_type_accuracy": type_ok_count / max(matched_count, 1),
             "evidence_hit_rate": evidence_ok_count / max(matched_count, 1),
+            "structured_evidence_rate": structured_evidence_count / max(len(risks), 1),
             "fact_expected_count": len(expected_facts),
             "fact_count": len(facts),
             "fact_hit_rate": fact_hit_count / max(len(expected_facts), 1),
+            "fact_source_ref_rate": facts_with_source_ref_count / max(len(facts), 1),
         },
         "ingestion": ingestion_report,
         "fact_matches": fact_matches,
         "facts": [fact.model_dump() for fact in facts],
         "human_context": human_context_report,
+        "auto_rerun": auto_rerun_report,
+        "question_lifecycle": question_lifecycle_report,
         "export_check": export_report,
         "matches": matches,
         "false_positives": false_positives,
         "questions": [question.model_dump() for question in questions],
+    }
+
+
+def _run_question_lifecycle_check() -> dict[str, Any]:
+    """验证重跑时 pending 问题保留、刷新、去重和过期清理。"""
+
+    state = ProjectState(config=ProjectConfig(project_name="eval-question-lifecycle", bom_path="mock.xlsx"))
+    pending = create_question(
+        question_kind="procurement_confirmation",
+        input_type="single_select",
+        title="确认供应商能力",
+        message="是否具备量产能力？",
+        reason="旧原因",
+        options=["未知"],
+        context={"source_excerpt": "同一依据"},
+        related_risk_ids=["old-risk"],
+        required=True,
+        blocking=False,
+    )
+    answered = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="已回答问题",
+        message="规格是否完整？",
+        context={"source_excerpt": "已回答依据"},
+        required=True,
+        blocking=False,
+    )
+    answer_question(answered, "无法确认，请保留风险。")
+    stale = create_question(
+        question_kind="risk_keep_review",
+        input_type="boolean",
+        title="这条风险是否保留？",
+        message="旧风险是否保留？",
+        context={"source_excerpt": "旧风险依据"},
+        related_risk_ids=["stale-risk"],
+        required=False,
+        blocking=False,
+    )
+    state.questions.extend([pending, answered, stale])
+    pending_id = pending.id
+
+    refreshed = create_question(
+        question_kind="procurement_confirmation",
+        input_type="single_select",
+        title="确认供应商能力",
+        message="是否具备量产能力？",
+        reason="新原因",
+        options=["具备", "不具备"],
+        context={"source_excerpt": "同一依据", "risk_id": "new-risk"},
+        related_risk_ids=["new-risk"],
+        required=True,
+        blocking=False,
+    )
+    ignored_answered = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="已回答问题",
+        message="规格是否完整？",
+        context={"source_excerpt": "已回答依据"},
+        required=True,
+        blocking=False,
+    )
+    new_question = create_question(
+        question_kind="risk_material_mapping",
+        input_type="single_select",
+        title="确认接口件对应物料",
+        message="请选择 BOM 物料。",
+        context={"source_excerpt": "新依据"},
+        required=True,
+        blocking=False,
+    )
+    upsert_result = _upsert_questions(state, [refreshed, ignored_answered, new_question])
+    state.risks = [
+        RiskItem(
+            id="new-risk",
+            material_name="结构化证据物料",
+            risk_type="关键性能风险",
+            risk_reason="验证问题关联风险仍有效。",
+            source_basis="mock",
+        )
+    ]
+    removed_count = _remove_stale_risk_action_questions(state)
+    refreshed_pending = next(question for question in state.questions if question.id == pending_id)
+
+    checks = {
+        "pending_id_preserved": refreshed_pending.id == pending_id,
+        "pending_refreshed": refreshed_pending.reason == "新原因" and refreshed_pending.related_risk_ids == ["new-risk"] and refreshed_pending.options == ["具备", "不具备"],
+        "answered_not_duplicated": len([question for question in state.questions if question.title == "已回答问题"]) == 1,
+        "new_question_added": any(question.title == "确认接口件对应物料" for question in state.questions),
+        "upsert_counts_ok": len(upsert_result["added"]) == 1 and len(upsert_result["refreshed"]) == 1 and len(upsert_result["ignored"]) == 1,
+        "stale_risk_question_removed": removed_count == 1 and all("stale-risk" not in question.related_risk_ids for question in state.questions),
+    }
+    return {
+        "status": "ok" if all(checks.values()) else "failed",
+        **checks,
+    }
+
+
+def _run_auto_rerun_check() -> dict[str, Any]:
+    """验证自动重跑只针对非阻塞必答 submit 回答。"""
+
+    state = ProjectState(config=ProjectConfig(project_name="eval-auto-rerun", bom_path="mock.xlsx"))
+    required_question = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="确认供应商能力",
+        required=True,
+        blocking=False,
+    )
+    answer_question(required_question, "需要保留风险。")
+    optional_question = create_question(
+        question_kind="risk_keep_review",
+        input_type="boolean",
+        title="可选风险保留",
+        required=False,
+        blocking=False,
+    )
+    answer_question(optional_question, "保留")
+    blocking_question = create_question(
+        question_kind="risk_material_mapping",
+        input_type="single_select",
+        title="阻塞物料映射",
+        required=True,
+        blocking=True,
+    )
+    answer_question(blocking_question, "P725PRO左轴功率模组")
+    running_state = ProjectState(config=ProjectConfig(project_name="eval-auto-rerun-running", bom_path="mock.xlsx"), status="running")
+    waiting_state = ProjectState(config=ProjectConfig(project_name="eval-auto-rerun-waiting", bom_path="mock.xlsx"), status="waiting")
+    waiting_state.questions.extend([required_question, create_question(
+        question_kind="risk_material_mapping",
+        input_type="single_select",
+        title="仍待确认的阻塞问题",
+        required=True,
+        blocking=True,
+    )])
+
+    checks = {
+        "required_non_blocking_submit": _should_auto_rerun_after_answer(state, required_question, "submit"),
+        "optional_submit_ignored": not _should_auto_rerun_after_answer(state, optional_question, "submit"),
+        "blocking_submit_ignored": not _should_auto_rerun_after_answer(state, blocking_question, "submit"),
+        "skip_ignored": not _should_auto_rerun_after_answer(state, required_question, "skip"),
+        "running_state_ignored": not _should_auto_rerun_after_answer(running_state, required_question, "submit"),
+        "other_blocking_pending_ignored": not _should_auto_rerun_after_answer(waiting_state, required_question, "submit"),
+    }
+    return {
+        "status": "ok" if all(checks.values()) else "failed",
+        **checks,
     }
 
 
@@ -274,6 +533,12 @@ def _run_export_check() -> dict[str, Any]:
         ),
     ]
     path = export_risks("eval-export-check", "eval-export-check", risks)
+    running_gate = _build_export_check(
+        ProjectState(
+            config=ProjectConfig(project_name="eval-running-export-gate", bom_path="mock.xlsx"),
+            status="running",
+        )
+    )
     wb = load_workbook(path)
     try:
         main_ws = wb["计划阶段风险物料"]
@@ -289,6 +554,7 @@ def _run_export_check() -> dict[str, Any]:
             "fallback_row_exists": any(row[0] == "兜底证据物料" and row[4] == "来源与依据" and "轴心为定制加工件" in str(row[10] or "") for row in evidence_rows),
             "confidence_formatted": any(row[0] == "结构化证据物料" and row[2] == "80%" for row in evidence_rows),
             "unresolved_questions_exported": any(row[0] == "结构化证据物料" and "量产校准能力" in str(row[3] or "") for row in evidence_rows),
+            "running_export_blocked": running_gate.allowed is False and "正在识别" in running_gate.message,
         }
     finally:
         wb.close()
@@ -322,20 +588,32 @@ def _keyword_facts_from_ingestion(case: dict[str, Any]) -> list[FactItem]:
     expected_facts = _load_expected_facts(case)
     if not prd_path or not expected_facts:
         return []
-    lines = ingest_document(prd_path, source_name="PRD").lines()
+    units = ingest_document(prd_path, source_name="PRD").units
     facts: list[FactItem] = []
     for expected in expected_facts:
         keywords = expected.get("keywords", [])
-        matched_lines = [line for line in lines if all(str(keyword) in line for keyword in keywords)]
-        if not matched_lines:
-            matched_lines = [line for line in lines if any(str(keyword) in line for keyword in keywords)]
-        if matched_lines:
+        matched_units = [unit for unit in units if all(str(keyword) in unit.as_line() for keyword in keywords)]
+        if not matched_units:
+            matched_units = [unit for unit in units if any(str(keyword) in unit.as_line() for keyword in keywords)]
+        if matched_units:
+            unit = matched_units[0]
             facts.append(
                 FactItem(
                     fact_type=str(expected.get("fact_type") or ""),
                     subject=" / ".join(str(keyword) for keyword in keywords[:3]),
                     value="；".join(str(keyword) for keyword in keywords),
-                    source_basis=matched_lines[0],
+                    source_basis=unit.as_line(),
+                    source_refs=[
+                        DocumentSourceRef(
+                            source_name=unit.source_name,
+                            file_name=unit.file_name,
+                            sheet=unit.sheet,
+                            row_number=unit.row_number,
+                            page_number=unit.page_number,
+                            parser=unit.parser,
+                            excerpt=unit.text,
+                        )
+                    ],
                 )
             )
     return facts
@@ -400,8 +678,26 @@ def _evidence_hit(expected: dict[str, Any], risk: RiskItem) -> bool:
     keywords = expected.get("evidence_keywords") or []
     if not keywords:
         return True
-    evidence = f"{risk.risk_reason} {risk.source_basis}"
+    evidence = " ".join(
+        [
+            risk.risk_reason,
+            risk.source_basis,
+            *[item.excerpt for item in risk.evidence_items],
+        ]
+    )
     return any(str(keyword) in evidence for keyword in keywords)
+
+
+def _has_structured_evidence(risk: RiskItem) -> bool:
+    """判断风险是否带有可追溯结构化证据。"""
+
+    return any(item.excerpt.strip() for item in risk.evidence_items)
+
+
+def _has_source_ref(fact: FactItem) -> bool:
+    """判断事实是否带有有效来源引用。"""
+
+    return any(ref.excerpt.strip() and (ref.file_name or ref.source_name) for ref in fact.source_refs)
 
 
 def _write_report(case_name: str, mode: str, report: dict[str, Any]) -> Path:

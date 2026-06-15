@@ -28,6 +28,7 @@ from .models import (
     ProjectConfig,
     ProjectState,
     ProjectSummary,
+    Question,
 )
 from .question_engine import (
     active_question,
@@ -201,7 +202,7 @@ def get_active_question(project_id: str):
 
 
 @app.post("/api/projects/{project_id}/questions/{question_id}/answer")
-def answer_question(project_id: str, question_id: str, payload: AnswerRequest) -> ProjectState:
+def answer_question(project_id: str, question_id: str, payload: AnswerRequest, background_tasks: BackgroundTasks) -> ProjectState:
     """提交人工确认答案，并更新项目状态。"""
 
     state = _load_or_404(project_id)
@@ -216,8 +217,11 @@ def answer_question(project_id: str, question_id: str, payload: AnswerRequest) -
         raise HTTPException(status_code=400, detail=str(exc))
 
     append_log(state, f"已处理人工确认问题：{question.title}。")
-    _refresh_status_after_question_answer(state)
-    save_project(state)
+    if _should_auto_rerun_after_answer(state, question, payload.action):
+        _schedule_rerun_after_answer(state, background_tasks)
+    else:
+        _refresh_status_after_question_answer(state)
+        save_project(state)
     return state
 
 
@@ -322,8 +326,38 @@ def _refresh_status_after_question_answer(state: ProjectState) -> None:
             state.current_step = "人工确认已完成，可继续运行"
 
 
+def _should_auto_rerun_after_answer(state: ProjectState, question: Question, action: str) -> bool:
+    """判断非阻塞必答问题回答后是否应自动重新识别。"""
+
+    return (
+        action == "submit"
+        and question.status == "answered"
+        and question.required
+        and not question.blocking
+        and state.status != "running"
+        and active_question(state) is None
+    )
+
+
+def _schedule_rerun_after_answer(state: ProjectState, background_tasks: BackgroundTasks) -> None:
+    """保存自动重跑状态并把识别任务放入后台。"""
+
+    state.status = "running"
+    state.current_step = "准备重新识别"
+    state.export_path = None
+    append_log(state, "已收到必答确认，自动重新识别以应用人工回答。")
+    save_project(state)
+    background_tasks.add_task(run_plan_stage, state)
+
+
 def _build_export_check(state: ProjectState) -> ExportCheckResponse:
     """生成正式导出门禁检查结果。"""
+
+    if state.status == "running":
+        return ExportCheckResponse(
+            allowed=False,
+            message="项目正在识别或重新识别，完成后才能下载正式 Excel。",
+        )
 
     pending_required = pending_required_questions(state)
     if not pending_required:

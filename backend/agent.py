@@ -53,12 +53,8 @@ def run_plan_stage(state: ProjectState) -> ProjectState:
     state.risks = []
     state.facts = []
     state.export_path = None
-    # 重新运行时保留已回答问题作为去重依据，清掉旧的非阻塞 pending 问题，避免重复生成。
-    state.questions = [
-        q
-        for q in state.questions
-        if q.status in {"answered", "skipped", "rejected"} or (q.status == "pending" and q.blocking)
-    ]
+    # 重新运行时保留全部问题；新生成问题会按签名 upsert，避免未回答问题消失或重复。
+    state.questions = [q for q in state.questions if q.status in {"answered", "skipped", "rejected", "pending"}]
     save_project(state)
 
     try:
@@ -199,8 +195,9 @@ def _node_fetch_lark(state: AgentState) -> AgentState:
     if messages:
         save_lark_messages(project.id, messages)
     project.__dict__["_lark_messages"] = messages
-    project.questions.extend(questions)
-    return {**state, "project": project, "questions": state.get("questions", []) + questions}
+    upsert_result = _upsert_questions(project, questions)
+    _append_question_upsert_log(project, upsert_result, "飞书群聊")
+    return {**state, "project": project, "questions": project.questions}
 
 
 def _node_extract_risks(state: AgentState) -> AgentState:
@@ -235,10 +232,10 @@ def _node_extract_risks(state: AgentState) -> AgentState:
     ]
     for extractor in extractors:
         source_risks, source_questions = extractor()
-        source_questions = _filter_repeated_questions(project, source_questions)
         risks.extend(source_risks)
-        generated_questions.extend(source_questions)
-        project.questions.extend(source_questions)
+        upsert_result = _upsert_questions(project, source_questions)
+        generated_questions.extend(upsert_result["added"])
+        generated_questions.extend(upsert_result["refreshed"])
         if active_question(project):
             append_log(project, f"候选风险物料已暂存 {len(risks)} 条，等待采购回答阻塞型问题。")
             return {**state, "project": project, "candidate_risks": risks, "questions": project.questions}
@@ -264,27 +261,110 @@ def _node_merge_and_question(state: AgentState) -> AgentState:
     merged = merge_risks(state.get("candidate_risks", []))
     questions = build_questions(merged)
     project.risks = merged
-    project.questions.extend(questions)
+    upsert_result = _upsert_questions(project, questions)
+    cleaned_count = _remove_stale_risk_action_questions(project)
+    _append_question_upsert_log(project, upsert_result, "风险合并")
+    if cleaned_count:
+        append_log(project, f"已清理过期风险确认问题 {cleaned_count} 个。")
     append_log(project, f"合并后风险物料 {len(merged)} 条，待人工确认问题 {len(project.questions)} 个。")
     save_project(project)
     return {**state, "project": project, "candidate_risks": merged, "questions": project.questions}
 
 
-def _filter_repeated_questions(project: ProjectState, questions: list[Question]) -> list[Question]:
-    """过滤已经回答过的同类问题，避免 resume 后重复打断采购。"""
+class QuestionUpsertResult(TypedDict):
+    """问题 upsert 结果，用于日志和评测。"""
+
+    added: list[Question]
+    refreshed: list[Question]
+    ignored: list[Question]
+
+
+def _upsert_questions(project: ProjectState, questions: list[Question]) -> QuestionUpsertResult:
+    """按问题签名新增或刷新 pending 问题，避免重跑后重复或丢失。"""
 
     answered_signatures = {
         _question_signature(question)
         for question in project.questions
         if question.status in {"answered", "skipped", "rejected"}
     }
-    fresh_questions: list[Question] = []
+    pending_by_signature = {
+        _question_signature(question): question
+        for question in project.questions
+        if question.status == "pending"
+    }
+    added: list[Question] = []
+    refreshed: list[Question] = []
+    ignored: list[Question] = []
     for question in questions:
         signature = _question_signature(question)
         if signature in answered_signatures:
+            ignored.append(question)
             continue
-        fresh_questions.append(question)
-    return fresh_questions
+        existing = pending_by_signature.get(signature)
+        if existing:
+            _refresh_pending_question(existing, question)
+            refreshed.append(existing)
+            continue
+        project.questions.append(question)
+        pending_by_signature[signature] = question
+        added.append(question)
+    return {"added": added, "refreshed": refreshed, "ignored": ignored}
+
+
+def _refresh_pending_question(existing: Question, incoming: Question) -> None:
+    """用新生成问题刷新旧 pending 问题，同时保留旧 id/status/answer。"""
+
+    existing.type = incoming.type
+    existing.question_kind = incoming.question_kind
+    existing.input_type = incoming.input_type
+    existing.title = incoming.title
+    existing.message = incoming.message
+    existing.reason = incoming.reason
+    existing.options = incoming.options
+    existing.default_value = incoming.default_value
+    existing.blocking = incoming.blocking
+    existing.required = incoming.required
+    existing.permission = incoming.permission
+    existing.context = incoming.context
+    existing.allow_custom = incoming.allow_custom
+    existing.related_risk_ids = incoming.related_risk_ids
+
+
+def _remove_stale_risk_action_questions(project: ProjectState) -> int:
+    """清理当前风险已不存在的风险保留/合并 pending 问题。"""
+
+    active_risk_ids = {risk.id for risk in project.risks}
+    kept: list[Question] = []
+    removed_count = 0
+    for question in project.questions:
+        if _is_stale_risk_action_question(question, active_risk_ids):
+            removed_count += 1
+            continue
+        kept.append(question)
+    project.questions = kept
+    return removed_count
+
+
+def _is_stale_risk_action_question(question: Question, active_risk_ids: set[str]) -> bool:
+    """判断风险操作类 pending 问题是否已失效。"""
+
+    return (
+        question.status == "pending"
+        and question.question_kind in {"risk_keep_review", "risk_merge_review"}
+        and bool(question.related_risk_ids)
+        and all(risk_id not in active_risk_ids for risk_id in question.related_risk_ids)
+    )
+
+
+def _append_question_upsert_log(project: ProjectState, result: QuestionUpsertResult, source_label: str) -> None:
+    """记录问题新增/刷新情况。"""
+
+    added_count = len(result["added"])
+    refreshed_count = len(result["refreshed"])
+    if added_count:
+        append_log(project, f"{source_label}新增确认问题 {added_count} 个。")
+    if refreshed_count:
+        append_log(project, f"{source_label}刷新已有确认问题 {refreshed_count} 个。")
 
 
 def _question_signature(question: Question) -> tuple[str, str, str, str]:

@@ -23,6 +23,24 @@ from .storage import load_llm_cache, save_llm_cache
 
 PROMPT_VERSION = "plan-risk-v3-human-answer-context"
 
+RISK_TYPE_ALIASES = {
+    "新技术风险": "新物料/新技术风险",
+    "新物料风险": "新物料/新技术风险",
+    "物料新技术风险": "新物料/新技术风险",
+    "供应风险": "供应资源风险",
+    "供应商风险": "供应资源风险",
+    "资源风险": "供应资源风险",
+    "周期风险": "长周期风险",
+    "交期风险": "长周期风险",
+    "工艺风险": "定制工艺风险",
+    "性能风险": "关键性能风险",
+    "成本风险": "成本达成风险",
+    "质量风险": "质量验证风险",
+    "验证风险": "质量验证风险",
+    "接口风险": "接口匹配风险",
+    "匹配风险": "接口匹配风险",
+}
+
 
 RISK_OUTPUT_JSON_SCHEMA = {
     "type": "object",
@@ -518,8 +536,7 @@ def _items_and_questions_from_model(
         source_basis = str(row.get("source_basis") or "").strip()
         if not material_name or not risk_reason or not source_basis:
             continue
-        if risk_type not in RISK_TYPES:
-            raise RuntimeError(f"大模型返回了非法风险类型：{risk_type}。请检查模型输出或提示词。")
+        risk_type = _normalize_risk_type(risk_type)
         risks.append(
             RiskItem(
                 material_name=material_name,
@@ -535,6 +552,24 @@ def _items_and_questions_from_model(
             )
         )
     return risks, _questions_from_model(raw_questions, source_name)
+
+
+def _normalize_risk_type(value: str) -> str:
+    """把模型返回的同义风险类型归一到固定枚举，避免单个别名中断整次识别。"""
+
+    risk_type = value.strip()
+    if risk_type in RISK_TYPES:
+        return risk_type
+    if risk_type in RISK_TYPE_ALIASES:
+        return RISK_TYPE_ALIASES[risk_type]
+    compact = normalize_name(risk_type)
+    for allowed in RISK_TYPES:
+        if compact == normalize_name(allowed):
+            return allowed
+    for alias, mapped in RISK_TYPE_ALIASES.items():
+        if compact == normalize_name(alias):
+            return mapped
+    return "新物料/新技术风险"
 
 
 def _questions_from_model(raw_questions: Any, source_name: str) -> list[Question]:

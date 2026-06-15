@@ -35,6 +35,7 @@ from backend.question_engine import build_human_answer_context, create_question,
 from backend.risk_rules import (
     _chunk_hash,
     _items_and_questions_from_model,
+    _normalize_risk_type,
     build_questions,
     extract_bom_risks,
     extract_document_risks,
@@ -192,6 +193,8 @@ def _threshold_check(report: dict[str, Any]) -> dict[str, Any]:
         failures.append("ingestion.dimension_repair_message_ok is not true")
     if report["question_lifecycle"].get("business_choice_boolean_compat") is not True:
         failures.append("question_lifecycle.business_choice_boolean_compat is not true")
+    if report["question_lifecycle"].get("risk_type_alias_check") is not True:
+        failures.append("question_lifecycle.risk_type_alias_check is not true")
     return {
         "status": "failed" if failures else "ok",
         "failures": failures,
@@ -464,6 +467,7 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
         "stale_risk_question_removed": removed_count == 1 and all("stale-risk" not in question.related_risk_ids for question in state.questions),
         "business_choice_boolean_compat": business_choice.input_type == "single_select" and business_choice.answer == "未定点，有候选",
         "real_boolean_still_boolean": keep_question.input_type == "boolean" and keep_question.answer is False,
+        "risk_type_alias_check": _normalize_risk_type("新技术风险") == "新物料/新技术风险",
     }
     return {
         "status": "ok" if all(checks.values()) else "failed",

@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 from backend.fact_rules import extract_document_facts, format_facts_for_prompt
 from backend.exporter import EVIDENCE_HEADERS, EXPORT_HEADERS, export_risks
-from backend.agent import _remove_stale_risk_action_questions, _upsert_questions
+from backend.agent import _question_signature, _remove_stale_risk_action_questions, _upsert_questions
 from backend.main import _build_export_check, _should_auto_rerun_after_answer
 from backend.models import DocumentSourceRef, FactItem, MaterialRecord, ProjectConfig, ProjectState, Question, RiskItem
 from backend.parsers.bom_parser import parse_bom
@@ -428,6 +428,27 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
         blocking=False,
     )
     upsert_result = _upsert_questions(state, [refreshed, ignored_answered, new_question])
+    answered_rephrased_base = create_question(
+        question_kind="risk_material_mapping",
+        input_type="textarea",
+        title="产品有KEO、SPD-SL、SPD三种制式脚踏，当前BOM仅列出M山地踏板组件，采购需确认",
+        message="请确认KEO制式和SPD-SL制式是否需要独立BOM。",
+        context={"source_excerpt": "PRD R50: KEO制式脚踏、SPD-SL制式脚踏、SPD制式脚踏；BOM中仅见P725PRO M山地踏板组件"},
+        required=True,
+        blocking=False,
+    )
+    answer_question(answered_rephrased_base, "这个需要跟研发确认")
+    state.questions.append(answered_rephrased_base)
+    rephrased_same_question = create_question(
+        question_kind="risk_material_mapping",
+        input_type="textarea",
+        title="三种脚踏制式的BOM结构确认",
+        message="PRD要求 KEO / SPD-SL / SPD 三种规格，但草BOM只看到M山地踏板组件，请确认其他制式是否单独建BOM。",
+        context={"source_excerpt": "[规格/版本] 规格: KEO制式脚踏、SPD-SL制式脚踏、SPD制式脚踏 | 依据:PRD R50；BOM中仅见P725PRO M左侧踏板组件"},
+        required=True,
+        blocking=False,
+    )
+    rephrased_upsert = _upsert_questions(state, [rephrased_same_question])
     business_choice = create_question(
         question_kind="procurement_confirmation",
         input_type="boolean",
@@ -468,6 +489,8 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
         "business_choice_boolean_compat": business_choice.input_type == "single_select" and business_choice.answer == "未定点，有候选",
         "real_boolean_still_boolean": keep_question.input_type == "boolean" and keep_question.answer is False,
         "risk_type_alias_check": _normalize_risk_type("新技术风险") == "新物料/新技术风险",
+        "rephrased_answered_question_ignored": len(rephrased_upsert["ignored"]) == 1
+        and _question_signature(answered_rephrased_base) == _question_signature(rephrased_same_question),
     }
     return {
         "status": "ok" if all(checks.values()) else "failed",

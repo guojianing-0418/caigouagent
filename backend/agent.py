@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, TypedDict
 
 from .exporter import export_risks
@@ -283,31 +284,44 @@ def _upsert_questions(project: ProjectState, questions: list[Question]) -> Quest
     """按问题签名新增或刷新 pending 问题，避免重跑后重复或丢失。"""
 
     _sync_completed_questions_from_latest(project)
-    answered_signatures = {
+    answered_exact_signatures = {
+        _question_exact_signature(question)
+        for question in project.questions
+        if question.status in {"answered", "skipped", "rejected"}
+    }
+    answered_stable_signatures = {
         _question_signature(question)
         for question in project.questions
         if question.status in {"answered", "skipped", "rejected"}
     }
-    pending_by_signature = {
-        _question_signature(question): question
+    pending_by_exact_signature = {
+        _question_exact_signature(question): question
         for question in project.questions
         if question.status == "pending"
     }
+    pending_by_stable_signature: dict[tuple[str, str, str], Question] = {}
+    for question in project.questions:
+        if question.status == "pending":
+            pending_by_stable_signature.setdefault(_question_signature(question), question)
     added: list[Question] = []
     refreshed: list[Question] = []
     ignored: list[Question] = []
     for question in questions:
-        signature = _question_signature(question)
-        if signature in answered_signatures:
+        exact_signature = _question_exact_signature(question)
+        stable_signature = _question_signature(question)
+        if exact_signature in answered_exact_signatures or stable_signature in answered_stable_signatures:
             ignored.append(question)
             continue
-        existing = pending_by_signature.get(signature)
+        existing = pending_by_exact_signature.get(exact_signature) or pending_by_stable_signature.get(stable_signature)
         if existing:
             _refresh_pending_question(existing, question)
             refreshed.append(existing)
+            pending_by_exact_signature[_question_exact_signature(existing)] = existing
+            pending_by_stable_signature[_question_signature(existing)] = existing
             continue
         project.questions.append(question)
-        pending_by_signature[signature] = question
+        pending_by_exact_signature[exact_signature] = question
+        pending_by_stable_signature[stable_signature] = question
         added.append(question)
     return {"added": added, "refreshed": refreshed, "ignored": ignored}
 
@@ -392,8 +406,18 @@ def _append_question_upsert_log(project: ProjectState, result: QuestionUpsertRes
         append_log(project, f"{source_label}刷新已有确认问题 {refreshed_count} 个。")
 
 
-def _question_signature(question: Question) -> tuple[str, str, str, str]:
-    """生成问题去重签名。"""
+def _question_signature(question: Question) -> tuple[str, str, str]:
+    """生成问题去重签名，允许模型重跑后轻微改写标题或描述。"""
+
+    return (
+        question.question_kind,
+        _question_stable_subject(question),
+        _question_stable_source(question),
+    )
+
+
+def _question_exact_signature(question: Question) -> tuple[str, str, str, str]:
+    """生成严格签名，用于完全相同问题的优先匹配。"""
 
     return (
         question.question_kind,
@@ -401,3 +425,65 @@ def _question_signature(question: Question) -> tuple[str, str, str, str]:
         question.message.strip(),
         str(question.context.get("source_excerpt") or "").strip(),
     )
+
+
+def _question_stable_subject(question: Question) -> str:
+    """从问题文本中提取稳定主题，降低模型改写导致的重复提问。"""
+
+    text = _normalize_question_text(" ".join([question.title, question.message, question.reason]))
+    keywords = sorted({keyword for keyword in _IMPORTANT_QUESTION_KEYWORDS if keyword in text})
+    if keywords:
+        return "|".join(keywords)
+    return text[:120]
+
+
+def _question_stable_source(question: Question) -> str:
+    """提取问题来源里的稳定锚点，如 PRD 行号、BOM 行号或相关风险 ID。"""
+
+    context = question.context or {}
+    source_excerpt = _normalize_question_text(str(context.get("source_excerpt") or ""))
+    source_text = _normalize_question_text(
+        " ".join(
+            [
+                str(context.get("source_name") or ""),
+                source_excerpt,
+                str(context.get("risk_id") or ""),
+                str(context.get("left_material") or ""),
+                str(context.get("right_material") or ""),
+            ]
+        )
+    )
+    anchors = re.findall(r"(?:PRD|BOM|R|row|行)\s*[:=]?\s*\d+", source_text, flags=re.IGNORECASE)
+    keywords = sorted({keyword for keyword in _IMPORTANT_QUESTION_KEYWORDS if keyword in source_text})
+    if anchors or keywords:
+        return "|".join(sorted(set(anchors)) + keywords)
+    if source_excerpt:
+        return source_excerpt[:120]
+    related_ids = [risk_id for risk_id in question.related_risk_ids if risk_id]
+    if related_ids:
+        return "risk:" + "|".join(sorted(related_ids))
+    return source_text[:120]
+
+
+def _normalize_question_text(value: str) -> str:
+    """压缩问题文本，去掉标点和空白，保留中英文数字关键词。"""
+
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", value).lower()
+
+
+_IMPORTANT_QUESTION_KEYWORDS = {
+    "keo",
+    "spd",
+    "spdsl",
+    "磁吸",
+    "充电",
+    "充电柱",
+    "应变片",
+    "fpc",
+    "碳纤维",
+    "踏板",
+    "锁片",
+    "轴心",
+    "供应商",
+    "定点",
+}

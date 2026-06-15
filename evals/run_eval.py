@@ -499,7 +499,7 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
 
 
 def _run_auto_rerun_check() -> dict[str, Any]:
-    """验证自动重跑只针对非阻塞必答 submit 回答。"""
+    """验证自动重跑只在所有非阻塞必答都答完后触发。"""
 
     state = ProjectState(config=ProjectConfig(project_name="eval-auto-rerun", bom_path="mock.xlsx"))
     required_question = create_question(
@@ -510,6 +510,19 @@ def _run_auto_rerun_check() -> dict[str, Any]:
         blocking=False,
     )
     answer_question(required_question, "需要保留风险。")
+    all_required_done_state = ProjectState(config=ProjectConfig(project_name="eval-auto-rerun-all-done", bom_path="mock.xlsx"))
+    all_required_done_state.questions.append(required_question)
+    partial_required_state = ProjectState(config=ProjectConfig(project_name="eval-auto-rerun-partial", bom_path="mock.xlsx"))
+    partial_required_state.questions.extend([
+        required_question,
+        create_question(
+            question_kind="procurement_confirmation",
+            input_type="textarea",
+            title="另一个必答问题",
+            required=True,
+            blocking=False,
+        ),
+    ])
     optional_question = create_question(
         question_kind="risk_keep_review",
         input_type="boolean",
@@ -537,7 +550,8 @@ def _run_auto_rerun_check() -> dict[str, Any]:
     )])
 
     checks = {
-        "required_non_blocking_submit": _should_auto_rerun_after_answer(state, required_question, "submit"),
+        "all_required_answered_submit": _should_auto_rerun_after_answer(all_required_done_state, required_question, "submit"),
+        "partial_required_answered_ignored": not _should_auto_rerun_after_answer(partial_required_state, required_question, "submit"),
         "optional_submit_ignored": not _should_auto_rerun_after_answer(state, optional_question, "submit"),
         "blocking_submit_ignored": not _should_auto_rerun_after_answer(state, blocking_question, "submit"),
         "skip_ignored": not _should_auto_rerun_after_answer(state, required_question, "skip"),

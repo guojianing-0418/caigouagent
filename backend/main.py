@@ -353,6 +353,7 @@ def _should_auto_rerun_after_answer(state: ProjectState, question: Question, act
         and not question.blocking
         and state.status != "running"
         and active_question(state) is None
+        and not pending_required_questions(state)
     )
 
 
@@ -362,7 +363,7 @@ def _schedule_rerun_after_answer(state: ProjectState, background_tasks: Backgrou
     state.status = "running"
     state.current_step = "准备重新识别"
     state.export_path = None
-    append_log(state, "已收到必答确认，自动重新识别以应用人工回答。")
+    append_log(state, "所有必答确认已完成，自动重新识别以应用人工回答。")
     save_project(state)
     background_tasks.add_task(run_plan_stage, state)
 

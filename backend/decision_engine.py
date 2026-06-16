@@ -5,13 +5,17 @@
 
 from __future__ import annotations
 
-import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 from .llm_client import call_json_required
 from .models import HumanDecision, ProjectState, Question
 
+DecisionClassifier = Callable[[Question, str], dict[str, Any] | None]
+
+_DISPOSITIONS = {"confirmed", "unresolved", "pending_external_confirmation", "out_of_scope", "ignored", "custom_note"}
+_RISK_EFFECTS = {"keep_risk", "remove_risk", "reduce_risk", "none"}
 
 DECISION_OUTPUT_JSON_SCHEMA = {
     "type": "object",
@@ -44,12 +48,18 @@ def sync_all_question_keys(state: ProjectState) -> None:
         sync_question_keys(question)
 
 
-def record_decision_for_question(state: ProjectState, question: Question, *, allow_llm: bool = True) -> HumanDecision:
+def record_decision_for_question(
+    state: ProjectState,
+    question: Question,
+    *,
+    allow_llm: bool = True,
+    llm_decision_fn: DecisionClassifier | None = None,
+) -> HumanDecision:
     """根据已处理问题生成或更新决策。"""
 
     sync_question_keys(question)
     answer_text = answer_to_text(question.answer)
-    decision = parse_human_decision(question, answer_text, allow_llm=allow_llm)
+    decision = parse_human_decision(question, answer_text, allow_llm=allow_llm, llm_decision_fn=llm_decision_fn)
     existing_index = next((index for index, item in enumerate(state.decisions) if item.question_id == question.id), None)
     if existing_index is None:
         state.decisions.append(decision)
@@ -73,8 +83,14 @@ def ensure_decisions_from_completed_questions(state: ProjectState, *, allow_llm:
     return created
 
 
-def parse_human_decision(question: Question, answer_text: str, *, allow_llm: bool = True) -> HumanDecision:
-    """规则优先、模型兜底地解析人工回答。"""
+def parse_human_decision(
+    question: Question,
+    answer_text: str,
+    *,
+    allow_llm: bool = True,
+    llm_decision_fn: DecisionClassifier | None = None,
+) -> HumanDecision:
+    """模型优先、规则兜底地解析人工回答。"""
 
     base = {
         "question_id": question.id,
@@ -83,12 +99,13 @@ def parse_human_decision(question: Question, answer_text: str, *, allow_llm: boo
         "answer_text": answer_text,
         "related_risk_ids": question.related_risk_ids,
     }
+    classifier = llm_decision_fn or _llm_decision
+    llm = _normalize_decision_payload(classifier(question, answer_text)) if allow_llm else None
+    if llm:
+        return HumanDecision(**base, **llm)
     rule = _rule_decision(answer_text)
     if rule:
         return HumanDecision(**base, **rule)
-    llm = _llm_decision(question, answer_text) if allow_llm else None
-    if llm:
-        return HumanDecision(**base, **llm)
     return HumanDecision(
         **base,
         disposition="custom_note",
@@ -304,6 +321,8 @@ def _llm_decision(question: Question, answer_text: str) -> dict[str, Any] | None
 用户回答：{answer_text}
 
 分类规则：
+- 必须结合问题标题、问题内容和用户回答整体判断，不要只按单个关键词分类。
+- 如果回答里有否定、转折或多个结论并存，按更保守的采购风险处理：需要外部角色确认优先于已确认，不确定/保留风险优先于已确认，不应把“不是不属于采购范围”判成 out_of_scope。
 - confirmed：用户给出明确确认、已有资源、已定点、已锁定等结论。
 - unresolved：用户表示待确认、不确定、先保留。
 - pending_external_confirmation：用户表示需要其他角色确认，例如研发、质量、客户。
@@ -319,19 +338,41 @@ def _llm_decision(question: Question, answer_text: str) -> dict[str, Any] | None
         return None
     if not isinstance(data, dict):
         return None
+    return _normalize_decision_payload(data)
+
+
+def _normalize_decision_payload(data: dict[str, Any] | None) -> dict[str, Any] | None:
+    """归一化模型或测试替身返回的决策载荷。"""
+
+    if not isinstance(data, dict):
+        return None
     disposition = str(data.get("disposition") or "custom_note")
-    if disposition not in {"confirmed", "unresolved", "pending_external_confirmation", "out_of_scope", "ignored", "custom_note"}:
+    if disposition not in _DISPOSITIONS:
         disposition = "custom_note"
     risk_effect = str(data.get("risk_effect") or "keep_risk")
-    if risk_effect not in {"keep_risk", "remove_risk", "reduce_risk", "none"}:
+    if risk_effect not in _RISK_EFFECTS:
         risk_effect = "keep_risk"
     return {
         "disposition": disposition,
         "owner": str(data.get("owner") or "").strip(),
         "risk_effect": risk_effect,
-        "ask_again": bool(data.get("ask_again", False)),
-        "export_blocking": bool(data.get("export_blocking", False)),
+        "ask_again": _as_bool(data.get("ask_again"), default=False),
+        "export_blocking": _as_bool(data.get("export_blocking"), default=False),
     }
+
+
+def _as_bool(value: Any, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "是", "需要", "继续"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "否", "不", "不用", "无需"}:
+            return False
+    return bool(value)
 
 
 def _decision_unresolved_note(decision: HumanDecision) -> str:

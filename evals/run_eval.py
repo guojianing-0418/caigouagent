@@ -27,7 +27,7 @@ from backend.fact_rules import extract_document_facts, format_facts_for_prompt
 from backend.exporter import EVIDENCE_HEADERS, EXPORT_HEADERS, export_risks
 from backend.agent import _dedupe_existing_questions, _question_signature, _remove_stale_risk_action_questions, _upsert_questions
 from backend.main import _build_export_check, _should_auto_rerun_after_answer
-from backend.decision_engine import record_decision_for_question, suppress_questions_by_decisions
+from backend.decision_engine import parse_human_decision, record_decision_for_question, suppress_questions_by_decisions
 from backend.models import DocumentSourceRef, FactItem, MaterialRecord, ProjectConfig, ProjectState, Question, RiskItem
 from backend.parsers.bom_parser import parse_bom
 from backend.parsers.document_parser import parse_document_lines
@@ -576,6 +576,50 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
     )
     cleanup_state.questions.extend([answered_cleanup_merge, pending_cleanup_duplicate])
     cleanup_removed_count = _dedupe_existing_questions(cleanup_state)
+
+    def fake_decision_classifier(question: Question, answer_text: str) -> dict[str, Any] | None:
+        if answer_text == "这个供应商需要跟研发确认":
+            return {
+                "disposition": "pending_external_confirmation",
+                "owner": "研发",
+                "risk_effect": "keep_risk",
+                "ask_again": False,
+                "export_blocking": False,
+            }
+        if answer_text == "不是不属于采购范围，只是供应商还需要研发确认":
+            return {
+                "disposition": "pending_external_confirmation",
+                "owner": "研发",
+                "risk_effect": "keep_risk",
+                "ask_again": "false",
+                "export_blocking": "false",
+            }
+        if answer_text == "目前有候选供应商，但价格和认证还没确认，先保留风险":
+            return {
+                "disposition": "unresolved",
+                "owner": "",
+                "risk_effect": "keep_risk",
+                "ask_again": False,
+                "export_blocking": False,
+            }
+        if answer_text == "这个物料本身已有供应商，不过连接方案需要客户确认":
+            return {
+                "disposition": "pending_external_confirmation",
+                "owner": "客户",
+                "risk_effect": "keep_risk",
+                "ask_again": False,
+                "export_blocking": False,
+            }
+        if answer_text == "模型返回非法字段":
+            return {
+                "disposition": "unknown",
+                "owner": None,
+                "risk_effect": "invalid",
+                "ask_again": "false",
+                "export_blocking": "false",
+            }
+        return None
+
     decision_state = ProjectState(config=ProjectConfig(project_name="eval-decision", bom_path="mock.xlsx"))
     supplier_rd_question = create_question(
         question_kind="procurement_confirmation",
@@ -587,7 +631,7 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
     )
     answer_question(supplier_rd_question, "这个供应商需要跟研发确认")
     decision_state.questions.append(supplier_rd_question)
-    rd_decision = record_decision_for_question(decision_state, supplier_rd_question)
+    rd_decision = record_decision_for_question(decision_state, supplier_rd_question, llm_decision_fn=fake_decision_classifier)
     supplier_duplicate = create_question(
         question_kind="procurement_confirmation",
         input_type="textarea",
@@ -609,7 +653,7 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
     )
     answer_question(mud_question, "这个先待定，保留为风险吧")
     unresolved_state.questions.append(mud_question)
-    unresolved_decision = record_decision_for_question(unresolved_state, mud_question)
+    unresolved_decision = record_decision_for_question(unresolved_state, mud_question, llm_decision_fn=fake_decision_classifier)
     out_of_scope_question = create_question(
         question_kind="procurement_confirmation",
         input_type="textarea",
@@ -619,7 +663,7 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
         blocking=False,
     )
     answer_question(out_of_scope_question, "不属于采购范围")
-    out_of_scope_decision = record_decision_for_question(unresolved_state, out_of_scope_question)
+    out_of_scope_decision = record_decision_for_question(unresolved_state, out_of_scope_question, llm_decision_fn=fake_decision_classifier)
     confirmed_question = create_question(
         question_kind="procurement_confirmation",
         input_type="textarea",
@@ -629,7 +673,61 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
         blocking=False,
     )
     answer_question(confirmed_question, "已有意向供应商")
-    confirmed_decision = record_decision_for_question(unresolved_state, confirmed_question)
+    confirmed_decision = record_decision_for_question(unresolved_state, confirmed_question, llm_decision_fn=fake_decision_classifier)
+    complex_scope_question = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="踏板供应商确认",
+        message="踏板供应商是否不属于采购范围？",
+        required=True,
+        blocking=False,
+    )
+    complex_scope_decision = parse_human_decision(
+        complex_scope_question,
+        "不是不属于采购范围，只是供应商还需要研发确认",
+        llm_decision_fn=fake_decision_classifier,
+    )
+    complex_supplier_question = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="供应商和认证确认",
+        message="请确认供应商、价格和认证状态。",
+        required=True,
+        blocking=False,
+    )
+    complex_supplier_decision = parse_human_decision(
+        complex_supplier_question,
+        "目前有候选供应商，但价格和认证还没确认，先保留风险",
+        llm_decision_fn=fake_decision_classifier,
+    )
+    complex_connector_question = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="电池连接方案确认",
+        message="请确认电池连接方案和供应商状态。",
+        required=True,
+        blocking=False,
+    )
+    complex_connector_decision = parse_human_decision(
+        complex_connector_question,
+        "这个物料本身已有供应商，不过连接方案需要客户确认",
+        llm_decision_fn=fake_decision_classifier,
+    )
+    invalid_llm_decision = parse_human_decision(
+        complex_connector_question,
+        "模型返回非法字段",
+        llm_decision_fn=fake_decision_classifier,
+    )
+    fallback_out_of_scope_decision = parse_human_decision(
+        out_of_scope_question,
+        "不属于采购范围",
+        llm_decision_fn=lambda _question, _answer: None,
+    )
+    fallback_custom_note_decision = parse_human_decision(
+        out_of_scope_question,
+        "这个结论记录一下，后续例会同步",
+        llm_decision_fn=lambda _question, _answer: None,
+    )
     business_choice = create_question(
         question_kind="procurement_confirmation",
         input_type="boolean",
@@ -696,6 +794,24 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
         and out_of_scope_decision.risk_effect == "remove_risk",
         "confirmed_decision": confirmed_decision.disposition == "confirmed"
         and confirmed_decision.risk_effect == "reduce_risk",
+        "llm_first_complex_negation": complex_scope_decision.disposition == "pending_external_confirmation"
+        and complex_scope_decision.owner == "研发"
+        and complex_scope_decision.ask_again is False
+        and complex_scope_decision.export_blocking is False,
+        "llm_first_complex_unresolved": complex_supplier_decision.disposition == "unresolved"
+        and complex_supplier_decision.risk_effect == "keep_risk",
+        "llm_first_external_beats_confirmed": complex_connector_decision.disposition == "pending_external_confirmation"
+        and complex_connector_decision.owner == "客户"
+        and complex_connector_decision.risk_effect == "keep_risk",
+        "invalid_llm_payload_normalized": invalid_llm_decision.disposition == "custom_note"
+        and invalid_llm_decision.risk_effect == "keep_risk"
+        and invalid_llm_decision.ask_again is False
+        and invalid_llm_decision.export_blocking is False,
+        "llm_failure_rule_fallback": fallback_out_of_scope_decision.disposition == "out_of_scope"
+        and fallback_out_of_scope_decision.risk_effect == "remove_risk",
+        "llm_failure_custom_note_fallback": fallback_custom_note_decision.disposition == "custom_note"
+        and fallback_custom_note_decision.risk_effect == "keep_risk"
+        and fallback_custom_note_decision.ask_again is False,
     }
     return {
         "status": "ok" if all(checks.values()) else "failed",

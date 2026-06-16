@@ -83,6 +83,7 @@ function App() {
     () => Boolean(project?.id && project.status !== "running" && modelReady && !activeQuestion),
     [project, modelReady, activeQuestion]
   );
+  const runButtonLabel = project?.status === "done" ? "重新识别/应用回答" : "开始识别";
   const panelQuestions = useMemo(
     () => sortQuestionsByPriority(questions.filter((question) => !activeQuestion || question.id !== activeQuestion.id)),
     [questions, activeQuestion]
@@ -236,9 +237,6 @@ function App() {
         body: JSON.stringify({ answer, action }),
       });
       setProject(data);
-      if (question.blocking) {
-        await request(`/api/projects/${project.id}/resume`, { method: "POST" });
-      }
       await refreshProject(project.id);
       await loadHistory();
       setNotice(answerNoticeForQuestion(question, action, data));
@@ -388,7 +386,7 @@ function App() {
                 </button>
                 <button className="primary-button" type="button" disabled={!canRun || busy} onClick={runProject}>
                   {project?.status === "running" ? <Loader2 className="spin" size={17} /> : <Play size={17} />}
-                  开始识别
+                  {runButtonLabel}
                 </button>
               </div>
               {!modelReady && <p className="hint-text">请先保存可用的大模型配置，否则不能开始识别。</p>}
@@ -733,10 +731,8 @@ function questionClassName(question, blocking) {
 }
 
 function answerNoticeForQuestion(question, action, projectState) {
+  if (projectState?.status === "running") return "确认结果已保存，Agent 已继续运行。";
   if (question.blocking) return "确认结果已保存，Agent 已继续运行。";
-  if (action === "submit" && question.required && projectState?.status === "running") {
-    return "确认结果已保存，已开始重新识别。";
-  }
   return "确认结果已保存。";
 }
 

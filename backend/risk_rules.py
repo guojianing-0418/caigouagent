@@ -313,6 +313,8 @@ def build_questions(risks: list[RiskItem]) -> list[Question]:
                     required=False,
                     context={
                         "risk_id": risk.id,
+                        "material_name": risk.material_name,
+                        "risk_type": risk.risk_type,
                         "source_excerpt": risk.source_basis,
                         "effect": "remove_related_risks_when_false",
                     },
@@ -339,6 +341,7 @@ def build_questions(risks: list[RiskItem]) -> list[Question]:
                         context={
                             "left_material": left.material_name,
                             "right_material": right.material_name,
+                            "risk_type": left.risk_type,
                             "source_excerpt": f"{left.source_basis}；{right.source_basis}",
                         },
                         related_risk_ids=[left.id, right.id],

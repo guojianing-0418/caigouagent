@@ -16,7 +16,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from .agent import run_plan_stage
+from .agent import _dedupe_existing_questions, resume_plan_stage, run_plan_stage
 from .config import ensure_data_dirs, get_effective_settings, mask_api_key, save_model_config, settings
 from .exporter import create_rd_risk_template, export_risks
 from .models import (
@@ -30,6 +30,7 @@ from .models import (
     ProjectSummary,
     Question,
 )
+from .decision_engine import ensure_decisions_from_completed_questions, record_decision_for_question, suppress_questions_by_decisions, sync_all_question_keys
 from .question_engine import (
     active_question,
     answer_question as record_question_answer,
@@ -168,7 +169,10 @@ def get_project_history() -> list[ProjectSummary]:
 def get_project(project_id: str) -> ProjectState:
     """查询项目状态。"""
 
-    return _load_or_404(project_id)
+    state = _load_or_404(project_id)
+    _migrate_question_decisions_if_needed(state)
+    _cleanup_duplicate_questions_if_needed(state)
+    return state
 
 
 @app.post("/api/projects/{project_id}/run")
@@ -179,6 +183,7 @@ def run_project(project_id: str, background_tasks: BackgroundTasks) -> dict[str,
     """
 
     state = _load_or_404(project_id)
+    _migrate_question_decisions_if_needed(state)
     if state.status == "running":
         return {"status": "running"}
     background_tasks.add_task(run_plan_stage, state)
@@ -190,6 +195,8 @@ def get_questions(project_id: str):
     """获取待人工确认问题。"""
 
     state = _load_or_404(project_id)
+    _migrate_question_decisions_if_needed(state)
+    _cleanup_duplicate_questions_if_needed(state)
     return [q for q in state.questions if q.status == "pending"]
 
 
@@ -198,6 +205,8 @@ def get_active_question(project_id: str):
     """获取当前阻塞流程的最高优先级问题。"""
 
     state = _load_or_404(project_id)
+    _migrate_question_decisions_if_needed(state)
+    _cleanup_duplicate_questions_if_needed(state)
     return active_question(state)
 
 
@@ -206,10 +215,12 @@ def answer_question(project_id: str, question_id: str, payload: AnswerRequest, b
     """提交人工确认答案，并更新项目状态。"""
 
     state = _load_or_404(project_id)
+    _migrate_question_decisions_if_needed(state)
     question = next((q for q in state.questions if q.id == question_id), None)
     if not question:
         raise HTTPException(status_code=404, detail="问题不存在。")
 
+    was_active_question = state.active_question_id == question_id
     try:
         record_question_answer(question, payload.answer, payload.action)
     except ValueError as exc:
@@ -218,9 +229,25 @@ def answer_question(project_id: str, question_id: str, payload: AnswerRequest, b
     state = _merge_answer_into_latest_state(project_id, state, question)
     question = next((q for q in state.questions if q.id == question_id), question)
     apply_question_effect(state, question)
+    decision = record_decision_for_question(state, question)
     append_log(state, f"已处理人工确认问题：{question.title}。")
-    if _should_auto_rerun_after_answer(state, question, payload.action):
-        _schedule_rerun_after_answer(state, background_tasks)
+    _cleanup_duplicate_questions_if_needed(state)
+    if was_active_question:
+        save_project(state)
+        background_tasks.add_task(
+            resume_plan_stage,
+            state.id,
+            {
+                "question_id": question.id,
+                "answer": question.answer,
+                "action": payload.action,
+                "decision_id": decision.id,
+            },
+        )
+        state.status = "running"
+        state.current_step = "继续识别"
+        state.active_question_id = None
+        save_project(state)
     else:
         _refresh_status_after_question_answer(state)
         save_project(state)
@@ -232,11 +259,12 @@ def resume_project(project_id: str, background_tasks: BackgroundTasks) -> dict[s
     """回答阻塞问题后继续 Agent 流程。"""
 
     state = _load_or_404(project_id)
+    _migrate_question_decisions_if_needed(state)
     if state.status == "running":
         return {"status": "running"}
     if active_question(state):
         raise HTTPException(status_code=400, detail="仍有阻塞问题未处理，不能继续运行。")
-    background_tasks.add_task(run_plan_stage, state)
+    background_tasks.add_task(resume_plan_stage, state.id, {})
     return {"status": "started"}
 
 
@@ -304,6 +332,32 @@ def _load_or_404(project_id: str) -> ProjectState:
         raise HTTPException(status_code=404, detail="项目不存在。")
 
 
+def _cleanup_duplicate_questions_if_needed(state: ProjectState) -> None:
+    """按业务指纹清理历史重复 pending 问题。"""
+
+    sync_all_question_keys(state)
+    suppress_questions_by_decisions(state)
+    removed_count = _dedupe_existing_questions(state)
+    if not removed_count:
+        return
+    append_log(state, f"已合并重复确认问题 {removed_count} 个。")
+    save_project(state)
+
+
+def _migrate_question_decisions_if_needed(state: ProjectState) -> None:
+    """懒迁移历史已处理问题到决策账本。"""
+
+    sync_all_question_keys(state)
+    created_count = ensure_decisions_from_completed_questions(state)
+    suppressed_count = suppress_questions_by_decisions(state)
+    if created_count or suppressed_count:
+        if created_count:
+            append_log(state, f"已同步历史人工决策 {created_count} 条。")
+        if suppressed_count:
+            append_log(state, f"已按人工决策隐藏重复确认问题 {suppressed_count} 个。")
+        save_project(state)
+
+
 def _refresh_status_after_question_answer(state: ProjectState) -> None:
     """按问题处理结果刷新项目状态和导出文件。
 
@@ -346,15 +400,7 @@ def _merge_answer_into_latest_state(project_id: str, state: ProjectState, answer
 def _should_auto_rerun_after_answer(state: ProjectState, question: Question, action: str) -> bool:
     """判断非阻塞必答问题回答后是否应自动重新识别。"""
 
-    return (
-        action == "submit"
-        and question.status == "answered"
-        and question.required
-        and not question.blocking
-        and state.status != "running"
-        and active_question(state) is None
-        and not pending_required_questions(state)
-    )
+    return False
 
 
 def _schedule_rerun_after_answer(state: ProjectState, background_tasks: BackgroundTasks) -> None:

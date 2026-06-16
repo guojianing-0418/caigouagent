@@ -25,8 +25,9 @@ sys.path.insert(0, str(ROOT))
 
 from backend.fact_rules import extract_document_facts, format_facts_for_prompt
 from backend.exporter import EVIDENCE_HEADERS, EXPORT_HEADERS, export_risks
-from backend.agent import _question_signature, _remove_stale_risk_action_questions, _upsert_questions
+from backend.agent import _dedupe_existing_questions, _question_signature, _remove_stale_risk_action_questions, _upsert_questions
 from backend.main import _build_export_check, _should_auto_rerun_after_answer
+from backend.decision_engine import record_decision_for_question, suppress_questions_by_decisions
 from backend.models import DocumentSourceRef, FactItem, MaterialRecord, ProjectConfig, ProjectState, Question, RiskItem
 from backend.parsers.bom_parser import parse_bom
 from backend.parsers.document_parser import parse_document_lines
@@ -101,6 +102,7 @@ def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
     human_context_report = _run_human_context_check()
     auto_rerun_report = _run_auto_rerun_check()
     question_lifecycle_report = _run_question_lifecycle_check()
+    checkpoint_report = _run_checkpoint_smoke_check()
 
     if mode == "mock":
         risks, questions, facts = _run_mock(case, materials)
@@ -121,6 +123,7 @@ def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
         export_report,
         auto_rerun_report,
         question_lifecycle_report,
+        checkpoint_report,
     )
     report["thresholds"] = _threshold_check(report) if mode == "mock" else {"status": "skipped", "failures": []}
     report_path = _write_report(case["case_name"], mode, report)
@@ -145,6 +148,7 @@ def _print_case_summary(report: dict[str, Any], report_path: Path) -> bool:
     print(f"human_context_hash_differs: {report['human_context']['hash_differs']}")
     print(f"auto_rerun_check: {report['auto_rerun']['status']}")
     print(f"question_lifecycle_check: {report['question_lifecycle']['status']}")
+    print(f"checkpoint_check: {report['checkpoint']['status']}")
     print(f"export_check: {report['export_check']['status']}")
     print(f"thresholds: {report['thresholds']['status']}")
     for failure in report["thresholds"].get("failures", []):
@@ -169,6 +173,7 @@ def _print_batch_summary(reports: list[tuple[dict[str, Any], Path]]) -> None:
             f"export={report['export_check']['status']} "
             f"auto_rerun={report['auto_rerun']['status']} "
             f"questions={report['question_lifecycle']['status']} "
+            f"checkpoint={report['checkpoint']['status']} "
             f"thresholds={report['thresholds']['status']}"
         )
 
@@ -184,7 +189,7 @@ def _threshold_check(report: dict[str, Any]) -> dict[str, Any]:
             failures.append(f"{key}={value:.2f} < {minimum:.2f}")
     if report["human_context"].get("hash_differs") is not True:
         failures.append("human_context.hash_differs is not true")
-    for section in ["auto_rerun", "question_lifecycle", "export_check"]:
+    for section in ["auto_rerun", "question_lifecycle", "checkpoint", "export_check"]:
         if report[section].get("status") != "ok":
             failures.append(f"{section}.status={report[section].get('status')}")
     if report["ingestion"].get("suspicious_title_only"):
@@ -293,6 +298,7 @@ def _build_report(
     export_report: dict[str, Any],
     auto_rerun_report: dict[str, Any],
     question_lifecycle_report: dict[str, Any],
+    checkpoint_report: dict[str, Any],
 ) -> dict[str, Any]:
     """计算召回、误报、类型准确率和证据命中率。"""
 
@@ -351,6 +357,7 @@ def _build_report(
         "human_context": human_context_report,
         "auto_rerun": auto_rerun_report,
         "question_lifecycle": question_lifecycle_report,
+        "checkpoint": checkpoint_report,
         "export_check": export_report,
         "matches": matches,
         "false_positives": false_positives,
@@ -449,6 +456,180 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
         blocking=False,
     )
     rephrased_upsert = _upsert_questions(state, [rephrased_same_question])
+    merge_question = create_question(
+        question_kind="risk_merge_review",
+        input_type="boolean",
+        title="以下两个风险物料是否合并？",
+        message="“P725PRO轴心-左侧”和“P725PRO轴心-右侧”名称相近，风险类型相同，是否合并？",
+        options=["合并", "不合并"],
+        context={
+            "left_material": "P725PRO轴心-左侧",
+            "right_material": "P725PRO轴心-右侧",
+            "source_excerpt": "PRD R48明确轴心材质为沉淀硬化型不锈钢。",
+        },
+        required=False,
+        blocking=False,
+    )
+    state.questions.append(merge_question)
+    merge_duplicate = create_question(
+        question_kind="risk_merge_review",
+        input_type="boolean",
+        title="以下两个风险物料是否合并？",
+        message="“P725PRO轴心-右侧”和“P725PRO轴心-左侧”名称相近，风险类型相同，是否合并？",
+        options=["合并", "不合并"],
+        context={
+            "left_material": "P725PRO轴心-右侧",
+            "right_material": "P725PRO轴心-左侧",
+            "source_excerpt": "草 BOM：人工确认供应商正在开发中。",
+        },
+        required=False,
+        blocking=False,
+    )
+    merge_duplicate_upsert = _upsert_questions(state, [merge_duplicate])
+    answer_question(merge_question, "不合并")
+    answered_merge_duplicate = create_question(
+        question_kind="risk_merge_review",
+        input_type="boolean",
+        title="以下两个风险物料是否合并？",
+        message="“P725PRO轴心-左侧”和“P725PRO轴心-右侧”是否合并？",
+        options=["合并", "不合并"],
+        context={
+            "left_material": "P725PRO轴心-左侧",
+            "right_material": "P725PRO轴心-右侧",
+            "source_excerpt": "另一轮识别生成的不同依据。",
+        },
+        required=False,
+        blocking=False,
+    )
+    answered_merge_duplicate_upsert = _upsert_questions(state, [answered_merge_duplicate])
+    same_subject_state = ProjectState(config=ProjectConfig(project_name="eval-question-same-subject", bom_path="mock.xlsx"))
+    carbon_supplier_mapping = create_question(
+        question_kind="risk_material_mapping",
+        input_type="textarea",
+        title="P725PRO M山地踏板本体长碳纤维注塑供应商是否已有储备",
+        message="PRD明确脚踏本体采用长碳纤维注塑工艺，请确认是否有已合作或推荐的长碳纤维注塑供应商？",
+        context={"source_excerpt": "[材料要求] 材质: 脚踏本体 长碳纤维注塑 | 依据:功率锁踏- R49"},
+        required=True,
+        blocking=False,
+    )
+    carbon_supplier_confirmation = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="长碳纤维注塑踏板本体供应商确认",
+        message="PRD要求脚踏本体材质为长碳纤维注塑，请确认是否已有该工艺的成熟供应商？模具开发周期预估多久？",
+        context={"source_excerpt": "功率锁踏- R49: 脚踏本体 长碳纤维注塑"},
+        required=True,
+        blocking=False,
+    )
+    same_subject_state.questions.append(carbon_supplier_mapping)
+    same_subject_upsert = _upsert_questions(same_subject_state, [carbon_supplier_confirmation])
+    pcba_state = ProjectState(config=ProjectConfig(project_name="eval-question-pcba", bom_path="mock.xlsx"))
+    pcba_supplier = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="PCBA供应商资源确认",
+        message="主板PCBA是否已有成熟供应商？是否沿用现有平台方案？",
+        context={"source_excerpt": "BOM: name=主板PCBA"},
+        required=True,
+        blocking=False,
+    )
+    pcba_cert_chip = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="PCBA认证芯片确认",
+        message="主板PCBA是否必须包含特定蓝牙/ANT+认证芯片型号？",
+        context={"source_excerpt": "PRD R25: Ant+、Bluetooth、CE、FCC、RoHS"},
+        required=True,
+        blocking=False,
+    )
+    _upsert_questions(pcba_state, [pcba_supplier])
+    pcba_distinct_upsert = _upsert_questions(pcba_state, [pcba_cert_chip])
+    cleanup_state = ProjectState(config=ProjectConfig(project_name="eval-question-cleanup", bom_path="mock.xlsx"))
+    answered_cleanup_merge = create_question(
+        question_kind="risk_merge_review",
+        input_type="boolean",
+        title="以下两个风险物料是否合并？",
+        message="“M7尾端螺钉-左轴”和“M7尾端螺钉-右轴”名称相近，风险类型相同，是否合并？",
+        options=["合并", "不合并"],
+        context={
+            "left_material": "M7尾端螺钉-左轴",
+            "right_material": "M7尾端螺钉-右轴",
+            "source_excerpt": "PRD R30盐雾要求72小时。",
+        },
+        required=False,
+        blocking=False,
+    )
+    answer_question(answered_cleanup_merge, "不合并")
+    pending_cleanup_duplicate = create_question(
+        question_kind="risk_merge_review",
+        input_type="boolean",
+        title="以下两个风险物料是否合并？",
+        message="“M7尾端螺钉-右轴”和“M7尾端螺钉-左轴”名称相近，风险类型相同，是否合并？",
+        options=["合并", "不合并"],
+        context={
+            "left_material": "M7尾端螺钉-右轴",
+            "right_material": "M7尾端螺钉-左轴",
+            "source_excerpt": "另一轮识别的证据摘要。",
+        },
+        required=False,
+        blocking=False,
+    )
+    cleanup_state.questions.extend([answered_cleanup_merge, pending_cleanup_duplicate])
+    cleanup_removed_count = _dedupe_existing_questions(cleanup_state)
+    decision_state = ProjectState(config=ProjectConfig(project_name="eval-decision", bom_path="mock.xlsx"))
+    supplier_rd_question = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="踏板供应商定厂状态确认",
+        message="请确认踏板供应商是否已定厂。",
+        required=True,
+        blocking=False,
+    )
+    answer_question(supplier_rd_question, "这个供应商需要跟研发确认")
+    decision_state.questions.append(supplier_rd_question)
+    rd_decision = record_decision_for_question(decision_state, supplier_rd_question)
+    supplier_duplicate = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="踏板供应商定厂结论",
+        message="当前踏板供应商是否已最终锁定？",
+        required=True,
+        blocking=False,
+    )
+    decision_state.questions.append(supplier_duplicate)
+    suppressed_supplier_count = suppress_questions_by_decisions(decision_state)
+    unresolved_state = ProjectState(config=ProjectConfig(project_name="eval-unresolved", bom_path="mock.xlsx"))
+    mud_question = create_question(
+        question_kind="risk_material_mapping",
+        input_type="textarea",
+        title="泥浆设备关联物料确认",
+        message="泥浆设备对应 BOM 哪个物料？",
+        required=True,
+        blocking=False,
+    )
+    answer_question(mud_question, "这个先待定，保留为风险吧")
+    unresolved_state.questions.append(mud_question)
+    unresolved_decision = record_decision_for_question(unresolved_state, mud_question)
+    out_of_scope_question = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="泥浆设备采购归属",
+        message="泥浆设备是否属于采购范围？",
+        required=True,
+        blocking=False,
+    )
+    answer_question(out_of_scope_question, "不属于采购范围")
+    out_of_scope_decision = record_decision_for_question(unresolved_state, out_of_scope_question)
+    confirmed_question = create_question(
+        question_kind="procurement_confirmation",
+        input_type="textarea",
+        title="锂电池供应商确认",
+        message="是否已有供应商？",
+        required=True,
+        blocking=False,
+    )
+    answer_question(confirmed_question, "已有意向供应商")
+    confirmed_decision = record_decision_for_question(unresolved_state, confirmed_question)
     business_choice = create_question(
         question_kind="procurement_confirmation",
         input_type="boolean",
@@ -491,6 +672,30 @@ def _run_question_lifecycle_check() -> dict[str, Any]:
         "risk_type_alias_check": _normalize_risk_type("新技术风险") == "新物料/新技术风险",
         "rephrased_answered_question_ignored": len(rephrased_upsert["ignored"]) == 1
         and _question_signature(answered_rephrased_base) == _question_signature(rephrased_same_question),
+        "merge_duplicate_refreshed": len(merge_duplicate_upsert["refreshed"]) == 1
+        and merge_duplicate_upsert["refreshed"][0].id == merge_question.id,
+        "answered_merge_duplicate_ignored": len(answered_merge_duplicate_upsert["ignored"]) == 1,
+        "same_subject_cross_kind_refreshed": len(same_subject_upsert["refreshed"]) == 1
+        and same_subject_upsert["refreshed"][0].id == carbon_supplier_mapping.id,
+        "pcba_distinct_intents_not_merged": len(pcba_distinct_upsert["added"]) == 1
+        and len(pcba_state.questions) == 2,
+        "historical_pending_duplicate_removed": cleanup_removed_count == 1
+        and len(cleanup_state.questions) == 1
+        and cleanup_state.questions[0].status == "answered",
+        "rd_confirmation_decision": rd_decision.disposition == "pending_external_confirmation"
+        and rd_decision.owner == "研发"
+        and rd_decision.risk_effect == "keep_risk"
+        and rd_decision.ask_again is False
+        and rd_decision.export_blocking is False,
+        "decision_suppresses_duplicate": suppressed_supplier_count == 1
+        and len([q for q in decision_state.questions if q.status == "pending"]) == 0,
+        "unresolved_answer_decision": unresolved_decision.disposition == "unresolved"
+        and unresolved_decision.ask_again is False
+        and unresolved_decision.export_blocking is False,
+        "out_of_scope_decision": out_of_scope_decision.disposition == "out_of_scope"
+        and out_of_scope_decision.risk_effect == "remove_risk",
+        "confirmed_decision": confirmed_decision.disposition == "confirmed"
+        and confirmed_decision.risk_effect == "reduce_risk",
     }
     return {
         "status": "ok" if all(checks.values()) else "failed",
@@ -550,7 +755,7 @@ def _run_auto_rerun_check() -> dict[str, Any]:
     )])
 
     checks = {
-        "all_required_answered_submit": _should_auto_rerun_after_answer(all_required_done_state, required_question, "submit"),
+        "all_required_answered_submit": not _should_auto_rerun_after_answer(all_required_done_state, required_question, "submit"),
         "partial_required_answered_ignored": not _should_auto_rerun_after_answer(partial_required_state, required_question, "submit"),
         "optional_submit_ignored": not _should_auto_rerun_after_answer(state, optional_question, "submit"),
         "blocking_submit_ignored": not _should_auto_rerun_after_answer(state, blocking_question, "submit"),
@@ -562,6 +767,54 @@ def _run_auto_rerun_check() -> dict[str, Any]:
         "status": "ok" if all(checks.values()) else "failed",
         **checks,
     }
+
+
+def _run_checkpoint_smoke_check() -> dict[str, Any]:
+    """验证 SQLite checkpoint interrupt/resume 不重跑已完成节点。"""
+
+    import sqlite3
+    import tempfile
+    from typing import TypedDict
+
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.graph import END, StateGraph
+    from langgraph.types import Command, interrupt
+
+    class SmokeState(TypedDict, total=False):
+        parsed_count: int
+        gate_count: int
+        answer: str
+
+    def parse_node(state: SmokeState) -> SmokeState:
+        return {**state, "parsed_count": state.get("parsed_count", 0) + 1}
+
+    def gate_node(state: SmokeState) -> SmokeState:
+        if not state.get("answer"):
+            answer = interrupt({"question": "mock"})
+            return {**state, "gate_count": state.get("gate_count", 0) + 1, "answer": str(answer)}
+        return state
+
+    path = tempfile.NamedTemporaryFile(delete=False).name
+    conn = sqlite3.connect(path, check_same_thread=False)
+    saver = SqliteSaver(conn)
+    saver.setup()
+    graph = StateGraph(SmokeState)
+    graph.add_node("parse", parse_node)
+    graph.add_node("gate", gate_node)
+    graph.set_entry_point("parse")
+    graph.add_edge("parse", "gate")
+    graph.add_edge("gate", END)
+    app = graph.compile(checkpointer=saver)
+    config = {"configurable": {"thread_id": "eval-checkpoint"}}
+    first = app.invoke({"parsed_count": 0}, config=config)
+    second = app.invoke(Command(resume="ok"), config=config)
+    checks = {
+        "interrupted": "__interrupt__" in first,
+        "resume_answer_applied": second.get("answer") == "ok",
+        "completed_node_not_rerun": second.get("parsed_count") == 1,
+        "gate_completed_once": second.get("gate_count") == 1,
+    }
+    return {"status": "ok" if all(checks.values()) else "failed", **checks}
 
 
 def _run_export_check() -> dict[str, Any]:

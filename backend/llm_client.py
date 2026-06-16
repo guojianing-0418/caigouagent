@@ -14,6 +14,9 @@ from typing import Any
 from .config import get_effective_settings
 
 
+_STRUCTURED_OUTPUT_UNSUPPORTED_MODELS: set[str] = set()
+
+
 def _client():
     """创建 OpenAI 兼容客户端。失败时返回 None。"""
 
@@ -93,6 +96,8 @@ def call_json_structured(prompt: str, schema: dict[str, Any], schema_name: str) 
     if client is None:
         return None
     runtime_settings = get_effective_settings()
+    if runtime_settings.text_model in _STRUCTURED_OUTPUT_UNSUPPORTED_MODELS:
+        return None
     try:
         response = client.chat.completions.create(
             model=runtime_settings.text_model,
@@ -110,6 +115,7 @@ def call_json_structured(prompt: str, schema: dict[str, Any], schema_name: str) 
         text = response.choices[0].message.content or ""
         return json.loads(_extract_json_text(text))
     except Exception:
+        _STRUCTURED_OUTPUT_UNSUPPORTED_MODELS.add(runtime_settings.text_model)
         return None
 
 

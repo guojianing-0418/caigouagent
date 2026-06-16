@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .decision_engine import build_decision_context
 from .models import ProjectState, Question, QuestionAction, QuestionInputType, QuestionPermission, normalize_question_input_type
 
 
@@ -131,6 +132,10 @@ def apply_question_effect(state: ProjectState, question: Question) -> ProjectSta
 def active_question(state: ProjectState) -> Question | None:
     """返回当前优先级最高的阻塞问题。"""
 
+    if state.active_question_id:
+        active = next((question for question in state.questions if question.id == state.active_question_id and question.status == "pending"), None)
+        if active:
+            return active
     pending = pending_blocking_questions(state)
     return pending[0] if pending else None
 
@@ -159,14 +164,21 @@ def build_human_answer_context(state: ProjectState, max_questions: int = 40, max
     """
 
     completed = [question for question in state.questions if question.status in {"answered", "skipped", "rejected"}]
-    if not completed:
+    decision_context = build_decision_context(state)
+    if not completed and not decision_context:
         return ""
 
     selected = completed[-max_questions:]
-    lines = [
-        "以下是本项目已处理的人工确认/补充信息，后续风险识别必须参考。",
-        "如果人工回答表达“不确定、无法确认、待确认”，不要把它当成已确认事实；应保留相应未决风险。",
-    ]
+    lines = []
+    if decision_context:
+        lines.append(decision_context)
+        lines.append("")
+    lines.extend(
+        [
+            "以下是本项目最近的人工确认原文，仅作补充参考。",
+            "如果结构化决策和原文有冲突，以结构化决策为准。",
+        ]
+    )
     omitted_count = len(completed) - len(selected)
     if omitted_count > 0:
         lines.append(f"前面还有 {omitted_count} 条较早的人工确认已省略，仅保留最近 {len(selected)} 条。")

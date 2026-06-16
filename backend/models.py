@@ -153,6 +153,14 @@ QuestionInputType = Literal["single_select", "multi_select", "boolean", "text", 
 QuestionPermission = Literal["allow", "ask", "deny"]
 QuestionStatus = Literal["pending", "answered", "skipped", "rejected"]
 QuestionAction = Literal["submit", "skip", "reject"]
+DecisionDisposition = Literal[
+    "confirmed",
+    "unresolved",
+    "pending_external_confirmation",
+    "out_of_scope",
+    "ignored",
+    "custom_note",
+]
 
 
 def normalize_question_input_type(input_type: Any, options: list[Any] | None = None) -> str:
@@ -206,6 +214,9 @@ class Question(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
     allow_custom: bool = True
     related_risk_ids: list[str] = Field(default_factory=list)
+    topic_key: str = ""
+    intent_key: str = ""
+    suppressed_by_decision_id: str | None = None
     status: QuestionStatus = "pending"
     answer: Any | None = None
 
@@ -252,8 +263,28 @@ class Question(BaseModel):
         data.setdefault("message", data.get("title", ""))
         data.setdefault("context", {})
         data.setdefault("allow_custom", True)
+        data.setdefault("topic_key", "")
+        data.setdefault("intent_key", "")
+        data.setdefault("suppressed_by_decision_id", None)
         data["input_type"] = normalize_question_input_type(data.get("input_type"), data.get("options"))
         return data
+
+
+class HumanDecision(BaseModel):
+    """人工回答结构化后的稳定决策。"""
+
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    question_id: str
+    topic_key: str = ""
+    intent_key: str = ""
+    answer_text: str = ""
+    disposition: DecisionDisposition = "custom_note"
+    owner: str = ""
+    risk_effect: str = "keep_risk"
+    ask_again: bool = False
+    export_blocking: bool = False
+    related_risk_ids: list[str] = Field(default_factory=list)
+    created_at: str = Field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
 
 class ProjectConfig(BaseModel):
@@ -282,6 +313,9 @@ class ProjectState(BaseModel):
     risks: list[RiskItem] = Field(default_factory=list)
     facts: list[FactItem] = Field(default_factory=list)
     questions: list[Question] = Field(default_factory=list)
+    decisions: list[HumanDecision] = Field(default_factory=list)
+    active_question_id: str | None = None
+    run_revision: int = 0
     export_path: str | None = None
     error: str | None = None
 

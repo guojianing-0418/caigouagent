@@ -7,11 +7,16 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from typing import Any
 
 from .models import LarkMessage, Question
 from .question_engine import create_question
+
+
+LARK_MESSAGE_PAGE_SIZE = 50
+LARK_MESSAGE_MAX_PAGES = 20
 
 
 def search_chats(query: str) -> tuple[list[dict[str, Any]], str | None]:
@@ -68,25 +73,67 @@ def fetch_messages_by_chat(project_id: str, chat_ref: str) -> tuple[list[LarkMes
             return [], questions, ["飞书群名匹配多个结果，等待人工选择。"]
         chat_id = chats[0].get("chat_id") or chats[0].get("open_chat_id") or chats[0].get("id") or chat_id
 
-    # page-all 是 lark-cli im +chat-messages-list 的自动分页参数；如果 CLI 版本不支持，会在 stderr 中提示。
-    args = ["im", "+chat-messages-list", "--chat-id", chat_id, "--as", "user", "--page-all", "--json"]
-    code, stdout, stderr = _run_lark(args)
-    if code != 0:
-        return [], questions, [f"飞书消息抓取失败：{stderr or stdout}"]
+    items, message_logs, error = _fetch_chat_message_pages(chat_id)
+    logs.extend(message_logs)
+    if error:
+        return [], questions, [f"飞书消息抓取失败：{error}"]
 
-    raw = _safe_json(stdout)
-    items = _find_items(raw, ["items", "messages", "data"])
     messages = [_message_from_raw(project_id, chat_id, item) for item in items]
     logs.append(f"已读取飞书群 {chat_id} 历史消息 {len(messages)} 条。")
     return messages, questions, logs
 
 
+def _fetch_chat_message_pages(chat_id: str) -> tuple[list[dict[str, Any]], list[str], str | None]:
+    """按 page_token 手动分页读取群消息。"""
+
+    items: list[dict[str, Any]] = []
+    logs: list[str] = []
+    page_token = ""
+    for page_index in range(LARK_MESSAGE_MAX_PAGES):
+        args = [
+            "im",
+            "+chat-messages-list",
+            "--chat-id",
+            chat_id,
+            "--as",
+            "user",
+            "--page-size",
+            str(LARK_MESSAGE_PAGE_SIZE),
+            "--order",
+            "asc",
+            "--no-reactions",
+            "--json",
+        ]
+        if page_token:
+            args.extend(["--page-token", page_token])
+
+        code, stdout, stderr = _run_lark(args)
+        if code != 0:
+            return items, logs, stderr or stdout
+
+        raw = _safe_json(stdout)
+        data = _extract_data(raw)
+        page_items = _find_items(data, ["messages", "items", "data"])
+        items.extend(page_items)
+        has_more = bool(data.get("has_more")) if isinstance(data, dict) else False
+        page_token = str(data.get("page_token") or "") if isinstance(data, dict) else ""
+        if not has_more or not page_token:
+            return items, logs, None
+
+    logs.append(f"飞书群消息超过 {LARK_MESSAGE_MAX_PAGES * LARK_MESSAGE_PAGE_SIZE} 条，本次仅读取前 {len(items)} 条。")
+    return items, logs, None
+
+
 def _run_lark(args: list[str]) -> tuple[int, str, str]:
     """运行 lark-cli，统一捕获错误。"""
 
+    executable = shutil.which("lark-cli")
+    if not executable:
+        return 127, "", "未找到 lark-cli，请先安装并完成飞书授权。"
+
     try:
         completed = subprocess.run(
-            ["lark-cli", *args],
+            [executable, *args],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -107,6 +154,14 @@ def _safe_json(text: str) -> Any:
         return json.loads(text)
     except Exception:
         return {}
+
+
+def _extract_data(data: Any) -> Any:
+    """兼容 lark-cli 的顶层 envelope。"""
+
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        return data["data"]
+    return data
 
 
 def _find_items(data: Any, preferred_keys: list[str]) -> list[dict[str, Any]]:

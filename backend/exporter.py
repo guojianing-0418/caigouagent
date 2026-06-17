@@ -46,7 +46,8 @@ def export_risks(project_id: str, project_name: str, risks: list[RiskItem]) -> P
     ws.append(EXPORT_HEADERS)
     _style_header(ws)
 
-    for risk in risks:
+    main_risks = _sort_risks_for_main_sheet(risks)
+    for risk in main_risks:
         ws.append(
             [
                 risk.material_name,
@@ -58,6 +59,7 @@ def export_risks(project_id: str, project_name: str, risks: list[RiskItem]) -> P
         )
 
     _style_body(ws, [24, 22, 20, 44, 80])
+    _merge_same_material_cells(ws)
     _append_evidence_sheet(wb, risks)
     wb.save(path)
     return path
@@ -133,6 +135,29 @@ def _format_confidence(confidence: float | None) -> str:
     if confidence is None:
         return ""
     return f"{max(0, min(100, round(confidence * 100)))}%"
+
+
+def _sort_risks_for_main_sheet(risks: list[RiskItem]) -> list[RiskItem]:
+    """主表按物料名相邻展示，同物料内保持原顺序。"""
+
+    indexed = list(enumerate(risks))
+    indexed.sort(key=lambda item: (item[1].material_name or "\uffff", item[0]))
+    return [risk for _, risk in indexed]
+
+
+def _merge_same_material_cells(ws: Worksheet) -> None:
+    """合并主表第一列中连续相同的物料名。"""
+
+    start_row = 2
+    while start_row <= ws.max_row:
+        material_name = ws.cell(row=start_row, column=1).value
+        end_row = start_row
+        while end_row + 1 <= ws.max_row and material_name and ws.cell(row=end_row + 1, column=1).value == material_name:
+            end_row += 1
+        if material_name and end_row > start_row:
+            ws.merge_cells(start_row=start_row, start_column=1, end_row=end_row, end_column=1)
+            ws.cell(row=start_row, column=1).alignment = Alignment(vertical="center", wrap_text=True)
+        start_row = end_row + 1
 
 
 def _style_header(ws: Worksheet) -> None:

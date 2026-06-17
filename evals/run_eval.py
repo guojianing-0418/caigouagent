@@ -965,6 +965,13 @@ def _run_export_check() -> dict[str, Any]:
             risk_reason="用于验证没有 evidence_items 时仍可导出来源依据。",
             source_basis="BOM：轴心为定制加工件。",
         ),
+        RiskItem(
+            material_name="结构化证据物料",
+            module="功率模块",
+            risk_type="认证风险",
+            risk_reason="用于验证相同物料的不同风险在主表相邻展示。",
+            source_basis="PRD：认证要求待补充。",
+        ),
     ]
     path = export_risks("eval-export-check", "eval-export-check", risks)
     running_gate = _build_export_check(
@@ -978,11 +985,15 @@ def _run_export_check() -> dict[str, Any]:
         main_ws = wb["计划阶段风险物料"]
         evidence_ws = wb["证据详情"]
         main_headers = [cell.value for cell in main_ws[1]]
+        main_materials = [main_ws.cell(row=row, column=1).value for row in range(2, main_ws.max_row + 1)]
+        merged_ranges = {str(cell_range) for cell_range in main_ws.merged_cells.ranges}
         evidence_headers = [cell.value for cell in evidence_ws[1]]
         evidence_rows = list(evidence_ws.iter_rows(min_row=2, values_only=True))
         checks = {
             "has_expected_sheets": "计划阶段风险物料" in wb.sheetnames and "证据详情" in wb.sheetnames,
             "main_headers_unchanged": main_headers == EXPORT_HEADERS,
+            "same_material_rows_adjacent": main_materials[:3] == ["兜底证据物料", "结构化证据物料", None],
+            "same_material_cells_merged": "A3:A4" in merged_ranges,
             "evidence_headers_ok": evidence_headers == EVIDENCE_HEADERS,
             "structured_row_exists": any(row[0] == "结构化证据物料" and row[4] == "PRD" and row[7] == 12 for row in evidence_rows),
             "fallback_row_exists": any(row[0] == "兜底证据物料" and row[4] == "来源与依据" and "轴心为定制加工件" in str(row[10] or "") for row in evidence_rows),

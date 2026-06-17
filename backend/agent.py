@@ -165,7 +165,17 @@ def _run_with_langgraph_if_available(initial: AgentState | Any, thread_id: str |
         from langgraph.checkpoint.sqlite import SqliteSaver
     except Exception:
         current = initial
-        for node in [_node_parse_inputs, _node_fetch_lark, _node_question_gate, _node_extract_facts, _node_question_gate, _node_extract_risks, _node_question_gate, _node_merge_and_question, _node_question_gate]:
+        for node in [
+            _node_parse_inputs,
+            _node_fetch_lark,
+            _node_question_gate_without_interrupt,
+            _node_extract_facts,
+            _node_question_gate_without_interrupt,
+            _node_extract_risks,
+            _node_question_gate_without_interrupt,
+            _node_merge_and_question,
+            _node_question_gate_without_interrupt,
+        ]:
             current = node(current)
         return current
 
@@ -424,6 +434,32 @@ def _node_question_gate(state: AgentState) -> AgentState:
     latest.active_question_id = None
     save_project(latest)
     return {**state, "project": latest.model_dump(mode="json"), "questions": [q.model_dump(mode="json") for q in latest.questions]}
+
+
+def _node_question_gate_without_interrupt(state: AgentState) -> AgentState:
+    """顺序执行模式的问题门禁，不能调用 LangGraph interrupt。"""
+
+    project = _coerce_project(state["project"])
+    try:
+        project = load_project(project.id)
+    except FileNotFoundError:
+        pass
+    _prepare_question_state(project)
+    pending = pending_required_questions(project)
+    if not pending:
+        project.active_question_id = None
+        if project.status == "waiting":
+            project.status = "running"
+            project.current_step = "继续识别"
+        save_project(project)
+        return {**state, "project": project.model_dump(mode="json"), "questions": [q.model_dump(mode="json") for q in project.questions]}
+
+    question = pending[0]
+    project.status = "waiting"
+    project.current_step = "等待人工确认"
+    project.active_question_id = question.id
+    save_project(project)
+    return {**state, "project": project.model_dump(mode="json"), "questions": [q.model_dump(mode="json") for q in project.questions], "__interrupt__": True}
 
 
 def _prepare_question_state(project: ProjectState) -> None:

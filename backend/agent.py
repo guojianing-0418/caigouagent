@@ -124,6 +124,9 @@ def resume_plan_stage(project_id: str, answer_payload: dict[str, Any] | None = N
     state.active_question_id = None
     save_project(state)
     try:
+        if not _can_use_langgraph_checkpoint():
+            return run_plan_stage(state)
+
         from langgraph.types import Command
 
         result = _run_with_langgraph_if_available(Command(resume=answer_payload or {}), thread_id=_thread_id(state))
@@ -160,24 +163,14 @@ def resume_plan_stage(project_id: str, answer_payload: dict[str, Any] | None = N
 def _run_with_langgraph_if_available(initial: AgentState | Any, thread_id: str | None = None) -> AgentState:
     """优先使用 LangGraph；没有依赖时按固定顺序执行节点。"""
 
+    if not _can_use_langgraph_checkpoint():
+        return _run_sequential(initial)
+
     try:
         from langgraph.graph import END, StateGraph
         from langgraph.checkpoint.sqlite import SqliteSaver
     except Exception:
-        current = initial
-        for node in [
-            _node_parse_inputs,
-            _node_fetch_lark,
-            _node_question_gate_without_interrupt,
-            _node_extract_facts,
-            _node_question_gate_without_interrupt,
-            _node_extract_risks,
-            _node_question_gate_without_interrupt,
-            _node_merge_and_question,
-            _node_question_gate_without_interrupt,
-        ]:
-            current = node(current)
-        return current
+        return _run_sequential(initial)
 
     graph = StateGraph(AgentState)
     graph.add_node("parse_inputs", _node_parse_inputs)
@@ -206,6 +199,37 @@ def _run_with_langgraph_if_available(initial: AgentState | Any, thread_id: str |
     saver.setup()
     compiled = graph.compile(checkpointer=saver)
     return compiled.invoke(initial, config={"configurable": {"thread_id": thread_id or "default"}})
+
+
+def _run_sequential(initial: AgentState) -> AgentState:
+    """Run the agent nodes without LangGraph checkpoint/interrupt support."""
+
+    current = initial
+    for node in [
+        _node_parse_inputs,
+        _node_fetch_lark,
+        _node_question_gate_without_interrupt,
+        _node_extract_facts,
+        _node_question_gate_without_interrupt,
+        _node_extract_risks,
+        _node_question_gate_without_interrupt,
+        _node_merge_and_question,
+        _node_question_gate_without_interrupt,
+    ]:
+        current = node(current)
+    return current
+
+
+def _can_use_langgraph_checkpoint() -> bool:
+    """Return whether the installed LangGraph supports checkpoint resume."""
+
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver  # noqa: F401
+        from langgraph.graph import StateGraph  # noqa: F401
+        from langgraph.types import Command  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 def _node_parse_inputs(state: AgentState) -> AgentState:

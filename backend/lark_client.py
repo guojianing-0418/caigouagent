@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 import shutil
 import subprocess
 from typing import Any
@@ -17,6 +19,10 @@ from .question_engine import create_question
 
 LARK_MESSAGE_PAGE_SIZE = 50
 LARK_MESSAGE_MAX_PAGES = 20
+LARK_CLI_NOT_FOUND_MESSAGE = (
+    "未找到 lark-cli。后端启动环境未能在 LARK_CLI_PATH、PATH 或 Windows npm 全局目录中找到 "
+    "lark-cli；这通常是启动后端的终端没有继承 npm 全局路径，不代表飞书授权失败。"
+)
 
 
 def search_chats(query: str) -> tuple[list[dict[str, Any]], str | None]:
@@ -127,13 +133,13 @@ def _fetch_chat_message_pages(chat_id: str) -> tuple[list[dict[str, Any]], list[
 def _run_lark(args: list[str]) -> tuple[int, str, str]:
     """运行 lark-cli，统一捕获错误。"""
 
-    executable = shutil.which("lark-cli")
-    if not executable:
-        return 127, "", "未找到 lark-cli，请先安装并完成飞书授权。"
+    command = _resolve_lark_cli_command()
+    if not command:
+        return 127, "", LARK_CLI_NOT_FOUND_MESSAGE
 
     try:
         completed = subprocess.run(
-            [executable, *args],
+            [*command, *args],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -142,9 +148,55 @@ def _run_lark(args: list[str]) -> tuple[int, str, str]:
         )
         return completed.returncode, completed.stdout, completed.stderr
     except FileNotFoundError:
-        return 127, "", "未找到 lark-cli，请先安装并完成飞书授权。"
+        return 127, "", LARK_CLI_NOT_FOUND_MESSAGE
     except subprocess.TimeoutExpired:
         return 124, "", "lark-cli 执行超时。"
+
+
+def _resolve_lark_cli_command() -> list[str] | None:
+    """Resolve lark-cli across PATH, explicit config, and npm global installs."""
+
+    for candidate in _lark_cli_candidates():
+        path = _normalize_lark_cli_candidate(candidate)
+        if not path:
+            continue
+        if path.suffix.lower() == ".ps1":
+            return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(path)]
+        return [str(path)]
+    return None
+
+
+def _lark_cli_candidates() -> list[str]:
+    candidates: list[str] = []
+    env_path = os.environ.get("LARK_CLI_PATH")
+    if env_path:
+        candidates.append(env_path)
+
+    for name in ("lark-cli", "lark-cli.cmd", "lark-cli.exe", "lark-cli.ps1"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        npm_dir = Path(appdata) / "npm"
+        candidates.extend(str(npm_dir / name) for name in ("lark-cli.cmd", "lark-cli.exe", "lark-cli.ps1", "lark-cli"))
+
+    return candidates
+
+
+def _normalize_lark_cli_candidate(candidate: str) -> Path | None:
+    path = Path(candidate).expanduser()
+    if path.is_file():
+        return path
+
+    resolved = shutil.which(candidate)
+    if resolved:
+        resolved_path = Path(resolved)
+        if resolved_path.is_file():
+            return resolved_path
+
+    return None
 
 
 def _safe_json(text: str) -> Any:

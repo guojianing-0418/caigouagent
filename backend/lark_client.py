@@ -105,7 +105,7 @@ def _fetch_chat_message_pages(chat_id: str) -> tuple[list[dict[str, Any]], list[
             "user",
             "--page-size",
             str(LARK_MESSAGE_PAGE_SIZE),
-            "--order",
+            "--sort",
             "asc",
             "--no-reactions",
             "--json",

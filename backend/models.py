@@ -147,6 +147,15 @@ class RiskItem(BaseModel):
     evidence_items: list[DocumentSourceRef] = Field(default_factory=list)
     confidence: float | None = None
     unresolved_questions: list[str] = Field(default_factory=list)
+    risk_confirmation_method: str = ""
+    primary_owner: str = ""
+    material_attribute: str = ""
+    risk_tags: list[str] = Field(default_factory=list)
+    information_maturity: str = ""
+    suggested_question_owner: str = ""
+    followup_questions: list[str] = Field(default_factory=list)
+    missing_information: list[str] = Field(default_factory=list)
+    classification_basis: str = ""
 
 
 QuestionInputType = Literal["single_select", "multi_select", "boolean", "text", "textarea"]

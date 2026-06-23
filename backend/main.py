@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from .agent import _dedupe_existing_questions, resume_plan_stage, run_plan_stage
 from .config import ensure_data_dirs, get_effective_settings, mask_api_key, save_model_config, settings
 from .exporter import create_rd_risk_template, export_risks
+from .risk_classification import ensure_risk_classification
 from .models import (
     AnswerRequest,
     ExportCheckQuestion,
@@ -291,6 +292,10 @@ def download_export(project_id: str) -> FileResponse:
     export_check = _build_export_check(state)
     if not export_check.allowed:
         raise HTTPException(status_code=409, detail=export_check.model_dump())
+    state.risks = ensure_risk_classification(state.risks)
+    if state.risks:
+        state.export_path = str(export_risks(state.id, state.config.project_name, state.risks))
+        save_project(state)
     if not state.export_path or not Path(state.export_path).exists():
         state.export_path = str(export_risks(state.id, state.config.project_name, state.risks))
         save_project(state)

@@ -16,6 +16,7 @@ from typing import Any
 
 from .decision_engine import build_decision_context
 from .models import ProjectState, Question, QuestionAction, QuestionInputType, QuestionPermission, normalize_question_input_type
+from .risk_classification import merge_classification_fields
 
 
 VALID_INPUT_TYPES = {"single_select", "multi_select", "boolean", "text", "textarea"}
@@ -303,6 +304,8 @@ def _merge_related_risks(state: ProjectState, related_risk_ids: list[str]) -> No
         return
     left.risk_reason = "；".join(_dedupe_text([left.risk_reason, right.risk_reason]))
     left.source_basis = "；".join(_dedupe_text([left.source_basis, right.source_basis]))
+    left.unresolved_questions = _dedupe_text([*left.unresolved_questions, *right.unresolved_questions])
+    merge_classification_fields(left, right)
     state.risks = [risk for risk in state.risks if risk.id != right_id]
 
 

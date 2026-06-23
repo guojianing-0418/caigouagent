@@ -27,6 +27,7 @@ from .parsers.bom_parser import parse_bom
 from .parsers.document_ingestor import ingest_document
 from .parsers.drawing_parser import parse_drawing_folder
 from .parsers.rd_risk_parser import parse_rd_risk_excel
+from .risk_classification import classify_risks, ensure_risk_classification
 from .risk_rules import (
     build_questions,
     extract_bom_risks,
@@ -103,6 +104,7 @@ def run_plan_stage(state: ProjectState) -> ProjectState:
         final_state.status = "done"
         final_state.current_step = "已完成"
         final_state.active_question_id = None
+        final_state.risks = ensure_risk_classification(final_state.risks)
         final_state.export_path = str(export_risks(final_state.id, final_state.config.project_name, final_state.risks))
         append_log(final_state, f"已导出风险物料清单：{final_state.export_path}")
         save_project(final_state)
@@ -146,6 +148,7 @@ def resume_plan_stage(project_id: str, answer_payload: dict[str, Any] | None = N
         final_state.status = "done"
         final_state.current_step = "已完成"
         final_state.active_question_id = None
+        final_state.risks = ensure_risk_classification(final_state.risks)
         final_state.export_path = str(export_risks(final_state.id, final_state.config.project_name, final_state.risks))
         append_log(final_state, f"已导出风险物料清单：{final_state.export_path}")
         save_project(final_state)
@@ -180,8 +183,10 @@ def _run_with_langgraph_if_available(initial: AgentState | Any, thread_id: str |
     graph.add_node("gate_after_facts", _node_question_gate)
     graph.add_node("extract_risks", _node_extract_risks)
     graph.add_node("gate_after_risks", _node_question_gate)
-    graph.add_node("merge_and_question", _node_merge_and_question)
-    graph.add_node("gate_after_merge", _node_question_gate)
+    graph.add_node("merge_risks", _node_merge_risks)
+    graph.add_node("classify_risks", _node_classify_risks)
+    graph.add_node("build_risk_questions", _node_build_risk_questions)
+    graph.add_node("gate_after_questions", _node_question_gate)
     graph.set_entry_point("parse_inputs")
     graph.add_edge("parse_inputs", "fetch_lark")
     graph.add_edge("fetch_lark", "gate_after_lark")
@@ -189,9 +194,11 @@ def _run_with_langgraph_if_available(initial: AgentState | Any, thread_id: str |
     graph.add_edge("extract_facts", "gate_after_facts")
     graph.add_edge("gate_after_facts", "extract_risks")
     graph.add_edge("extract_risks", "gate_after_risks")
-    graph.add_edge("gate_after_risks", "merge_and_question")
-    graph.add_edge("merge_and_question", "gate_after_merge")
-    graph.add_edge("gate_after_merge", END)
+    graph.add_edge("gate_after_risks", "merge_risks")
+    graph.add_edge("merge_risks", "classify_risks")
+    graph.add_edge("classify_risks", "build_risk_questions")
+    graph.add_edge("build_risk_questions", "gate_after_questions")
+    graph.add_edge("gate_after_questions", END)
     checkpoint_path = settings.data_dir / "cache" / "langgraph_checkpoints.sqlite3"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(checkpoint_path, check_same_thread=False)
@@ -213,7 +220,9 @@ def _run_sequential(initial: AgentState) -> AgentState:
         _node_question_gate_without_interrupt,
         _node_extract_risks,
         _node_question_gate_without_interrupt,
-        _node_merge_and_question,
+        _node_merge_risks,
+        _node_classify_risks,
+        _node_build_risk_questions,
         _node_question_gate_without_interrupt,
     ]:
         current = node(current)
@@ -393,8 +402,8 @@ def _node_extract_risks(state: AgentState) -> AgentState:
     }
 
 
-def _node_merge_and_question(state: AgentState) -> AgentState:
-    """节点：合并去重并生成待确认问题。"""
+def _node_merge_risks(state: AgentState) -> AgentState:
+    """节点：合并同物料、同风险类型的候选风险。"""
 
     project = _coerce_project(state["project"])
     if active_question(project):
@@ -406,19 +415,68 @@ def _node_merge_and_question(state: AgentState) -> AgentState:
     save_project(project)
 
     merged = merge_risks([_coerce_risk(item) for item in state.get("candidate_risks", [])])
-    questions = build_questions(merged)
     project.risks = merged
-    upsert_result = _upsert_questions(project, questions)
-    cleaned_count = _remove_stale_risk_action_questions(project)
-    _append_question_upsert_log(project, upsert_result, "风险合并")
-    if cleaned_count:
-        append_log(project, f"已清理过期风险确认问题 {cleaned_count} 个。")
-    append_log(project, f"合并后风险物料 {len(merged)} 条，待人工确认问题 {len(project.questions)} 个。")
+    append_log(project, f"合并后风险物料 {len(merged)} 条。")
     save_project(project)
     return {
         **state,
         "project": project.model_dump(mode="json"),
         "candidate_risks": [risk.model_dump(mode="json") for risk in merged],
+        "questions": [question.model_dump(mode="json") for question in project.questions],
+    }
+
+
+def _node_classify_risks(state: AgentState) -> AgentState:
+    """节点：为风险补充主归口、物料属性、标签和可发群问题。"""
+
+    project = _coerce_project(state["project"])
+    if active_question(project):
+        project.current_step = "等待人工确认"
+        save_project(project)
+        return {**state, "project": project.model_dump(mode="json"), "candidate_risks": state.get("candidate_risks", [])}
+
+    project.current_step = "风险分类与问题清单"
+    save_project(project)
+
+    materials = [_coerce_material(item) for item in state.get("materials", [])]
+    classified = classify_risks([_coerce_risk(item) for item in state.get("candidate_risks", [])], materials)
+    project.risks = classified
+    append_log(project, f"已完成风险分类、标签和采购前置问题生成 {len(classified)} 条。")
+    save_project(project)
+    return {
+        **state,
+        "project": project.model_dump(mode="json"),
+        "candidate_risks": [risk.model_dump(mode="json") for risk in classified],
+        "questions": [question.model_dump(mode="json") for question in project.questions],
+    }
+
+
+def _node_build_risk_questions(state: AgentState) -> AgentState:
+    """节点：基于风险结果生成现有人工确认问题。"""
+
+    project = _coerce_project(state["project"])
+    if active_question(project):
+        project.current_step = "等待人工确认"
+        save_project(project)
+        return {**state, "project": project.model_dump(mode="json"), "candidate_risks": state.get("candidate_risks", [])}
+
+    project.current_step = "生成风险确认问题"
+    save_project(project)
+
+    risks = [_coerce_risk(item) for item in state.get("candidate_risks", [])]
+    questions = build_questions(risks)
+    project.risks = risks
+    upsert_result = _upsert_questions(project, questions)
+    cleaned_count = _remove_stale_risk_action_questions(project)
+    _append_question_upsert_log(project, upsert_result, "风险确认")
+    if cleaned_count:
+        append_log(project, f"已清理过期风险确认问题 {cleaned_count} 个。")
+    append_log(project, f"待人工确认问题 {len(project.questions)} 个。")
+    save_project(project)
+    return {
+        **state,
+        "project": project.model_dump(mode="json"),
+        "candidate_risks": [risk.model_dump(mode="json") for risk in risks],
         "questions": [question.model_dump(mode="json") for question in project.questions],
     }
 

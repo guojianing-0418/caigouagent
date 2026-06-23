@@ -33,6 +33,7 @@ from backend.parsers.bom_parser import parse_bom
 from backend.parsers.document_parser import parse_document_lines
 from backend.parsers.document_ingestor import ingest_document
 from backend.question_engine import build_human_answer_context, create_question, answer_question
+from backend.risk_classification import classify_risks
 from backend.risk_rules import (
     _chunk_hash,
     _items_and_questions_from_model,
@@ -110,6 +111,7 @@ def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
         risks, questions, facts = _run_live(case, materials)
 
     export_report = _run_export_check()
+    classification_report = _run_classification_check()
     report = _build_report(
         case["case_name"],
         mode,
@@ -121,6 +123,7 @@ def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
         ingestion_report,
         human_context_report,
         export_report,
+        classification_report,
         auto_rerun_report,
         question_lifecycle_report,
         checkpoint_report,
@@ -150,6 +153,7 @@ def _print_case_summary(report: dict[str, Any], report_path: Path) -> bool:
     print(f"question_lifecycle_check: {report['question_lifecycle']['status']}")
     print(f"checkpoint_check: {report['checkpoint']['status']}")
     print(f"export_check: {report['export_check']['status']}")
+    print(f"classification_check: {report['classification']['status']}")
     print(f"thresholds: {report['thresholds']['status']}")
     for failure in report["thresholds"].get("failures", []):
         print(f"threshold_failure: {failure}")
@@ -189,7 +193,7 @@ def _threshold_check(report: dict[str, Any]) -> dict[str, Any]:
             failures.append(f"{key}={value:.2f} < {minimum:.2f}")
     if report["human_context"].get("hash_differs") is not True:
         failures.append("human_context.hash_differs is not true")
-    for section in ["auto_rerun", "question_lifecycle", "checkpoint", "export_check"]:
+    for section in ["auto_rerun", "question_lifecycle", "checkpoint", "export_check", "classification"]:
         if report[section].get("status") != "ok":
             failures.append(f"{section}.status={report[section].get('status')}")
     if report["ingestion"].get("suspicious_title_only"):
@@ -212,7 +216,7 @@ def _run_mock(case: dict[str, Any], materials: list[MaterialRecord]) -> tuple[li
 
     data = json.loads(Path(case["mock_output_path"]).read_text(encoding="utf-8"))
     risks, model_questions = _items_and_questions_from_model(data, "mock", materials)
-    merged = merge_risks(risks)
+    merged = classify_risks(merge_risks(risks), materials)
     questions = model_questions + build_questions(merged)
     facts = _keyword_facts_from_ingestion(case)
     return merged, questions, facts
@@ -243,7 +247,7 @@ def _run_live(case: dict[str, Any], materials: list[MaterialRecord]) -> tuple[li
         risks.extend(prd_risks)
         questions.extend(prd_questions)
 
-    merged = merge_risks(risks)
+    merged = classify_risks(merge_risks(risks), materials)
     questions.extend(build_questions(merged))
     return merged, questions, facts
 
@@ -296,6 +300,7 @@ def _build_report(
     ingestion_report: dict[str, Any],
     human_context_report: dict[str, Any],
     export_report: dict[str, Any],
+    classification_report: dict[str, Any],
     auto_rerun_report: dict[str, Any],
     question_lifecycle_report: dict[str, Any],
     checkpoint_report: dict[str, Any],
@@ -359,6 +364,7 @@ def _build_report(
         "question_lifecycle": question_lifecycle_report,
         "checkpoint": checkpoint_report,
         "export_check": export_report,
+        "classification": classification_report,
         "matches": matches,
         "false_positives": false_positives,
         "questions": [question.model_dump() for question in questions],
@@ -934,7 +940,7 @@ def _run_checkpoint_smoke_check() -> dict[str, Any]:
 
 
 def _run_export_check() -> dict[str, Any]:
-    """验证导出工作簿主表兼容，且证据详情页可用。"""
+    """验证导出工作簿主表、问题分发清单和证据详情页可用。"""
 
     from openpyxl import load_workbook
 
@@ -983,17 +989,32 @@ def _run_export_check() -> dict[str, Any]:
     wb = load_workbook(path)
     try:
         main_ws = wb["计划阶段风险物料"]
+        question_ws = wb["问题分发清单"]
         evidence_ws = wb["证据详情"]
         main_headers = [cell.value for cell in main_ws[1]]
         main_materials = [main_ws.cell(row=row, column=1).value for row in range(2, main_ws.max_row + 1)]
         merged_ranges = {str(cell_range) for cell_range in main_ws.merged_cells.ranges}
+        question_headers = [cell.value for cell in question_ws[1]]
+        question_rows = list(question_ws.iter_rows(min_row=2, values_only=True))
         evidence_headers = [cell.value for cell in evidence_ws[1]]
         evidence_rows = list(evidence_ws.iter_rows(min_row=2, values_only=True))
         checks = {
-            "has_expected_sheets": "计划阶段风险物料" in wb.sheetnames and "证据详情" in wb.sheetnames,
-            "main_headers_unchanged": main_headers == EXPORT_HEADERS,
+            "has_expected_sheets": "计划阶段风险物料" in wb.sheetnames and "问题分发清单" in wb.sheetnames and "证据详情" in wb.sheetnames,
+            "main_headers_ok": main_headers == EXPORT_HEADERS,
             "same_material_rows_adjacent": main_materials[:3] == ["兜底证据物料", "结构化证据物料", None],
             "same_material_cells_merged": "A3:A4" in merged_ranges,
+            "question_sheet_headers_ok": question_headers == [
+                "风险物料名称",
+                "风险类型",
+                "主归口",
+                "建议提问对象",
+                "可发群问题",
+                "需要补齐的信息",
+                "信息成熟度",
+                "来源与依据",
+            ],
+            "question_rows_exist": len(question_rows) >= 3,
+            "classification_fields_exported": any(row[0] == "兜底证据物料" and row[5] for row in main_ws.iter_rows(min_row=2, values_only=True)),
             "evidence_headers_ok": evidence_headers == EVIDENCE_HEADERS,
             "structured_row_exists": any(row[0] == "结构化证据物料" and row[4] == "PRD" and row[7] == 12 for row in evidence_rows),
             "fallback_row_exists": any(row[0] == "兜底证据物料" and row[4] == "来源与依据" and "轴心为定制加工件" in str(row[10] or "") for row in evidence_rows),
@@ -1009,6 +1030,62 @@ def _run_export_check() -> dict[str, Any]:
         "path": str(path),
         **checks,
     }
+
+
+def _run_classification_check() -> dict[str, Any]:
+    """验证风险分类规则不改变风险数量，并能覆盖典型场景。"""
+
+    materials = [
+        MaterialRecord(name="主板 PCBA", module="电子", spec="PCBA组件"),
+        MaterialRecord(name="轴心", module="结构", spec="按图加工", material="7075-T6"),
+        MaterialRecord(name="未知风险物料", module=""),
+    ]
+    risks = [
+        RiskItem(
+            material_name="进口芯片",
+            module="电子",
+            risk_type="长周期风险",
+            risk_reason="供应商反馈交期长，可能影响齐套。",
+            source_basis="群聊：该芯片交期 12 周。",
+        ),
+        RiskItem(
+            material_name="轴心",
+            module="结构",
+            risk_type="定制工艺风险",
+            risk_reason="轴心需要按图加工，公差和热处理未冻结。",
+            source_basis="BOM：轴心为定制加工件。",
+        ),
+        RiskItem(
+            material_name="主板 PCBA",
+            module="电子",
+            risk_type="关键性能风险",
+            risk_reason="功率精度和校准一致性需要验证。",
+            source_basis="PRD：功率精度要求 ±1.0%。",
+        ),
+        RiskItem(
+            material_name="待确认物料",
+            module="",
+            risk_type="接口匹配风险",
+            risk_reason="资料中提到接口匹配风险，但未对应到 BOM 物料。",
+            source_basis="群聊：接口件待确认。",
+        ),
+    ]
+    classified = classify_risks(risks, materials)
+    long_lead = classified[0]
+    process = classified[1]
+    performance = classified[2]
+    unknown = classified[3]
+    checks = {
+        "risk_count_unchanged": len(classified) == len(risks),
+        "long_lead_procurement": long_lead.primary_owner == "采购" and long_lead.risk_confirmation_method == "采购确认",
+        "long_lead_tags": "长周期" in long_lead.risk_tags and "齐套交付" in long_lead.risk_tags,
+        "custom_process_joint": process.risk_confirmation_method == "协同确认" and process.primary_owner in {"结构", "工艺"},
+        "custom_process_questions": bool(process.followup_questions) and any("图纸" in question or "DFM" in question for question in process.followup_questions),
+        "performance_rd_or_joint": performance.risk_confirmation_method in {"研发确认", "协同确认"} and performance.primary_owner in {"电子", "结构"},
+        "unknown_not_fabricated": unknown.primary_owner == "待确认" or unknown.material_attribute == "待确认",
+        "unknown_missing_info": "BOM物料对应关系" in unknown.missing_information,
+    }
+    return {"status": "ok" if all(checks.values()) else "failed", **checks}
 
 
 def _run_ingestion_checks(case: dict[str, Any]) -> dict[str, Any]:

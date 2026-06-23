@@ -211,6 +211,7 @@ def extract_bom_risks(
 
     lines = [
         f"sheet={item.sheet}; row={item.row_number}; module={item.module}; level={item.level}; "
+        f"path={item.bom_path}; parent={item.parent_name}; role={item.item_role}; "
         f"name={item.name}; spec={item.spec}; material={item.material}; quantity={item.quantity}"
         for item in materials
     ]
@@ -481,7 +482,11 @@ def _material_context(materials: list[MaterialRecord], limit: int = 180) -> str:
 
     rows = []
     for item in materials[:limit]:
-        rows.append(f"- {item.name} | 模块:{item.module} | 规格:{item.spec} | 材质:{item.material}")
+        rows.append(
+            f"- {item.name} | 层级:{item.level} | 路径:{item.bom_path or item.name} | "
+            f"上级:{item.parent_name or '无'} | 角色:{item.item_role or '待确认'} | "
+            f"模块:{item.module} | 规格:{item.spec} | 材质:{item.material}"
+        )
     if len(materials) > limit:
         rows.append(f"- 其余 {len(materials) - limit} 条物料略")
     return "\n".join(rows) or "无 BOM 物料清单"

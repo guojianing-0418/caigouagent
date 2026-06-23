@@ -112,6 +112,7 @@ def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
 
     export_report = _run_export_check()
     classification_report = _run_classification_check()
+    bom_hierarchy_report = _run_bom_hierarchy_check(materials)
     report = _build_report(
         case["case_name"],
         mode,
@@ -124,6 +125,7 @@ def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
         human_context_report,
         export_report,
         classification_report,
+        bom_hierarchy_report,
         auto_rerun_report,
         question_lifecycle_report,
         checkpoint_report,
@@ -154,6 +156,7 @@ def _print_case_summary(report: dict[str, Any], report_path: Path) -> bool:
     print(f"checkpoint_check: {report['checkpoint']['status']}")
     print(f"export_check: {report['export_check']['status']}")
     print(f"classification_check: {report['classification']['status']}")
+    print(f"bom_hierarchy_check: {report['bom_hierarchy']['status']}")
     print(f"thresholds: {report['thresholds']['status']}")
     for failure in report["thresholds"].get("failures", []):
         print(f"threshold_failure: {failure}")
@@ -193,7 +196,7 @@ def _threshold_check(report: dict[str, Any]) -> dict[str, Any]:
             failures.append(f"{key}={value:.2f} < {minimum:.2f}")
     if report["human_context"].get("hash_differs") is not True:
         failures.append("human_context.hash_differs is not true")
-    for section in ["auto_rerun", "question_lifecycle", "checkpoint", "export_check", "classification"]:
+    for section in ["auto_rerun", "question_lifecycle", "checkpoint", "export_check", "classification", "bom_hierarchy"]:
         if report[section].get("status") != "ok":
             failures.append(f"{section}.status={report[section].get('status')}")
     if report["ingestion"].get("suspicious_title_only"):
@@ -301,6 +304,7 @@ def _build_report(
     human_context_report: dict[str, Any],
     export_report: dict[str, Any],
     classification_report: dict[str, Any],
+    bom_hierarchy_report: dict[str, Any],
     auto_rerun_report: dict[str, Any],
     question_lifecycle_report: dict[str, Any],
     checkpoint_report: dict[str, Any],
@@ -365,6 +369,7 @@ def _build_report(
         "checkpoint": checkpoint_report,
         "export_check": export_report,
         "classification": classification_report,
+        "bom_hierarchy": bom_hierarchy_report,
         "matches": matches,
         "false_positives": false_positives,
         "questions": [question.model_dump() for question in questions],
@@ -1036,8 +1041,8 @@ def _run_classification_check() -> dict[str, Any]:
     """验证风险分类规则不改变风险数量，并能覆盖典型场景。"""
 
     materials = [
-        MaterialRecord(name="主板 PCBA", module="电子", spec="PCBA组件"),
-        MaterialRecord(name="轴心", module="结构", spec="按图加工", material="7075-T6"),
+        MaterialRecord(name="主板 PCBA", module="电子", spec="PCBA组件", level="1.6.3", parent_name="透光罩组件", bom_path="P725PRO左轴功率模组 > 透光罩组件 > 主板 PCBA", item_role="零件"),
+        MaterialRecord(name="轴心", module="结构", spec="按图加工", material="7075-T6", level="1.1.1", parent_name="贴片组件", bom_path="P725PRO左轴功率模组 > 贴片组件 > 轴心", item_role="零件"),
         MaterialRecord(name="未知风险物料", module=""),
     ]
     risks = [
@@ -1082,8 +1087,31 @@ def _run_classification_check() -> dict[str, Any]:
         "custom_process_joint": process.risk_confirmation_method == "协同确认" and process.primary_owner in {"结构", "工艺"},
         "custom_process_questions": bool(process.followup_questions) and any("图纸" in question or "DFM" in question for question in process.followup_questions),
         "performance_rd_or_joint": performance.risk_confirmation_method in {"研发确认", "协同确认"} and performance.primary_owner in {"电子", "结构"},
+        "classification_basis_has_bom_path": "路径" in performance.classification_basis and "透光罩组件" in performance.classification_basis,
         "unknown_not_fabricated": unknown.primary_owner == "待确认" or unknown.material_attribute == "待确认",
-        "unknown_missing_info": "BOM物料对应关系" in unknown.missing_information,
+        "unknown_missing_info": "对应BOM物料确认" in unknown.missing_information,
+    }
+    return {"status": "ok" if all(checks.values()) else "failed", **checks}
+
+
+def _run_bom_hierarchy_check(materials: list[MaterialRecord]) -> dict[str, Any]:
+    """验证 BOM 项目层级已解析成父子路径。"""
+
+    def find_material(name: str, level: str = "") -> MaterialRecord | None:
+        return next((item for item in materials if item.name == name and (not level or item.level == level)), None)
+
+    strain = find_material("电阻应变片", "1.1.2.1")
+    right_strain = next((item for item in materials if item.name == "电阻应变片" and item.level == "1.1.2.1" and "右轴" in item.bom_path), None)
+    pcba = find_material("主板PCBA", "1.6.3") or find_material("主板 PCBA", "1.6.3")
+    root = find_material("P725PRO左轴功率模组", "1")
+    malformed = MaterialRecord(name="异常层级物料", level="abc")
+    checks = {
+        "strain_parent_ok": bool(strain and strain.parent_name == "应变片贴片组件"),
+        "strain_path_ok": bool(strain and "P725PRO左轴功率模组" in strain.bom_path and "应变片贴片组件" in strain.bom_path and strain.bom_path.endswith("电阻应变片")),
+        "duplicate_level_right_path_ok": bool(right_strain and "P725PRO右轴功率模组" in right_strain.bom_path),
+        "pcba_parent_ok": bool(pcba and pcba.parent_name == "透光罩组件"),
+        "root_role_ok": bool(root and root.item_role == "总成" and root.has_children is True),
+        "malformed_default_ok": malformed.level_depth == 0 and malformed.item_role == "",
     }
     return {"status": "ok" if all(checks.values()) else "failed", **checks}
 

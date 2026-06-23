@@ -204,7 +204,7 @@ def classify_risk(risk: RiskItem, material: MaterialRecord | None = None) -> Ris
     maturity = _information_maturity(risk, material)
     suggested_owner = _suggested_question_owner(owner, confirmation_method)
     missing_info = _missing_information(risk, material, tags, material_attribute)
-    followup_questions = _followup_questions(risk, owner, confirmation_method, material_attribute, tags, missing_info)
+    followup_questions = _followup_questions(risk, material, owner, confirmation_method, material_attribute, tags, missing_info)
     basis = _classification_basis(risk, owner, confirmation_method, material_attribute, tags, material, maturity)
 
     risk.risk_confirmation_method = confirmation_method
@@ -263,7 +263,7 @@ def _fallback_classification(risk: RiskItem, reason: str) -> RiskItem:
     risk.information_maturity = risk.information_maturity or MATURITY_POTENTIAL
     risk.suggested_question_owner = risk.suggested_question_owner or "项目采购代表先确认主设计/采购归口"
     risk.followup_questions = risk.followup_questions or [f"请确认“{risk.material_name or '该物料'}”的风险归口、规格状态、样件需求和采购前置要求。"]
-    risk.missing_information = risk.missing_information or ["主归口", "物料属性", "图纸/规格状态", "样件数量", "到样时间", "验收要求"]
+    risk.missing_information = risk.missing_information or ["对应BOM物料确认", "主归口", "物料属性", "图纸/规格状态", "样件数量", "到样时间", "验收要求"]
     risk.classification_basis = risk.classification_basis or reason
     return risk
 
@@ -278,7 +278,19 @@ def _risk_text(risk: RiskItem, material: MaterialRecord | None) -> str:
         "；".join(risk.unresolved_questions),
     ]
     if material:
-        parts.extend([material.name, material.module, material.spec, material.material, material.level, material.quantity])
+        parts.extend(
+            [
+                material.name,
+                material.module,
+                material.spec,
+                material.material,
+                material.level,
+                material.parent_name,
+                material.bom_path,
+                material.item_role,
+                material.quantity,
+            ]
+        )
     return " ".join(part for part in parts if part).lower()
 
 
@@ -401,7 +413,7 @@ def _missing_information(risk: RiskItem, material: MaterialRecord | None, tags: 
     missing: list[str] = []
     text = _risk_text(risk, material)
     if not material or risk.material_name in {"待确认物料", "未知物料", ""}:
-        missing.append("BOM物料对应关系")
+        missing.append("对应BOM物料确认")
     if material_attribute in {MAT_CUSTOM, MAT_PROCESSING, MAT_SPECIAL_STANDARD} and "图纸" not in text:
         missing.append("可发供应商评估的图纸/规格版本")
     if material and not material.spec:
@@ -423,6 +435,7 @@ def _missing_information(risk: RiskItem, material: MaterialRecord | None, tags: 
 
 def _followup_questions(
     risk: RiskItem,
+    material: MaterialRecord | None,
     owner: str,
     confirmation_method: str,
     material_attribute: str,
@@ -430,26 +443,29 @@ def _followup_questions(
     missing_info: list[str],
 ) -> list[str]:
     name = risk.material_name or "该物料"
+    scope = _material_scope(material)
     questions: list[str] = []
     if owner == OWNER_STRUCTURE:
-        questions.append(f"请结构确认“{name}”的图纸/规格是否已冻结，哪些版本可以发供应商预评估？")
+        questions.append(f"请结构确认“{name}”{scope}的图纸/规格是否已冻结，哪些版本可以发供应商预评估？")
         if {"开模", "关键尺寸", "防水", "盐雾", "材料", "表面处理", "装配匹配"} & set(tags):
             questions.append(f"请结构说明“{name}”是否涉及开模、关键尺寸、材料/表面处理、防水盐雾或装配匹配要求。")
     elif owner == OWNER_ELECTRONICS:
-        questions.append(f"请电子确认“{name}”是否为新选型，是否已有 AVL、替代料和成熟供应商。")
+        questions.append(f"请电子确认“{name}”{scope}是否为新选型，是否已有 AVL、替代料和成熟供应商。")
         if {"认证资料", "通信法规", "电池法规", "PCBA", "芯片"} & set(tags):
             questions.append(f"请电子确认“{name}”是否影响认证、通信/电池法规、PCBA测试或替代料验证。")
     elif owner == OWNER_PROCESS:
-        questions.append(f"请工艺确认“{name}”是否需要外协工艺、DFM、工装、治具或检具提前评估。")
+        questions.append(f"请工艺确认“{name}”{scope}是否需要外协工艺、DFM、工装、治具或检具提前评估。")
         if {"良率", "一致性", "低压注塑", "委外加工"} & set(tags):
             questions.append(f"请工艺确认“{name}”样机阶段使用临时工艺还是正式工艺，良率和一致性风险在哪里。")
     elif owner == OWNER_PROCUREMENT:
-        questions.append(f"请寻源采购确认“{name}”是否已有成熟供应商，交期、MOQ、报价和二供是否有风险。")
+        questions.append(f"请寻源采购确认“{name}”{scope}是否已有成熟供应商，交期、MOQ、报价和二供是否有风险。")
         if {"新供应商", "供方能力", "长周期", "齐套交付"} & set(tags):
             questions.append(f"请采购确认供应商此前是否做过类似“{name}”，是否需要提前审厂、DFM或备选供应商。")
     else:
         questions.append(f"请主设计先确认“{name}”的归口负责人、物料属性、图纸/规格状态和采购前置要求。")
 
+    if material and material.has_children:
+        questions.append(f"“{name}”是BOM中的{material.item_role}，请确认风险是作用于该组件整体，还是需要下钻到其下级具体物料。")
     if confirmation_method == CONFIRM_JOINT:
         questions.append(f"“{name}”同时涉及研发定义和采购/供应商能力，请主设计、工艺和寻源采购一起确认前置动作。")
     if material_attribute == UNKNOWN or missing_info:
@@ -476,7 +492,21 @@ def _classification_basis(
     if tags:
         basis_parts.append(f"命中标签={_join_cn(tags[:8])}")
     if material:
-        material_desc = _join_cn([part for part in [material.spec, material.material, f"BOM行{material.row_number}" if material.row_number else ""] if part])
+        material_desc = _join_cn(
+            [
+                part
+                for part in [
+                    f"层级{material.level}" if material.level else "",
+                    f"路径{material.bom_path}" if material.bom_path else "",
+                    f"上级{material.parent_name}" if material.parent_name else "",
+                    f"角色{material.item_role}" if material.item_role else "",
+                    material.spec,
+                    material.material,
+                    f"BOM行{material.row_number}" if material.row_number else "",
+                ]
+                if part
+            ]
+        )
         if material_desc:
             basis_parts.append(f"BOM信息={material_desc}")
     if risk.unresolved_questions:
@@ -509,6 +539,16 @@ def _dedupe(values: list[str]) -> list[str]:
 def _join_cn(values: list[str]) -> str:
     clean = _dedupe(values)
     return "、".join(clean) if clean else "待确认信息"
+
+
+def _material_scope(material: MaterialRecord | None) -> str:
+    if not material:
+        return ""
+    if material.parent_name:
+        return f"（上级：{material.parent_name}）"
+    if material.bom_path and material.bom_path != material.name:
+        return f"（路径：{material.bom_path}）"
+    return ""
 
 
 def split_multi_text(value: str | list[str]) -> list[str]:

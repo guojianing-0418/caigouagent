@@ -117,6 +117,12 @@ class MaterialRecord(BaseModel):
     module: str = ""
     sheet: str = ""
     level: str = ""
+    parent_level: str = ""
+    parent_name: str = ""
+    bom_path: str = ""
+    level_depth: int = 0
+    has_children: bool = False
+    item_role: str = ""
     spec: str = ""
     material: str = ""
     quantity: str = ""

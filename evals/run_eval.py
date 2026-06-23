@@ -33,6 +33,7 @@ from backend.parsers.bom_parser import parse_bom
 from backend.parsers.document_parser import parse_document_lines
 from backend.parsers.document_ingestor import ingest_document
 from backend.question_engine import build_human_answer_context, create_question, answer_question
+from backend.question_governor import compact_project_questions, limit_source_questions
 from backend.risk_classification import classify_risks
 from backend.risk_rules import (
     _chunk_hash,
@@ -112,6 +113,7 @@ def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
 
     export_report = _run_export_check()
     classification_report = _run_classification_check()
+    question_volume_report = _run_question_volume_check()
     bom_hierarchy_report = _run_bom_hierarchy_check(materials)
     report = _build_report(
         case["case_name"],
@@ -125,6 +127,7 @@ def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
         human_context_report,
         export_report,
         classification_report,
+        question_volume_report,
         bom_hierarchy_report,
         auto_rerun_report,
         question_lifecycle_report,
@@ -156,6 +159,7 @@ def _print_case_summary(report: dict[str, Any], report_path: Path) -> bool:
     print(f"checkpoint_check: {report['checkpoint']['status']}")
     print(f"export_check: {report['export_check']['status']}")
     print(f"classification_check: {report['classification']['status']}")
+    print(f"question_volume_check: {report['question_volume']['status']}")
     print(f"bom_hierarchy_check: {report['bom_hierarchy']['status']}")
     print(f"thresholds: {report['thresholds']['status']}")
     for failure in report["thresholds"].get("failures", []):
@@ -178,6 +182,7 @@ def _print_batch_summary(reports: list[tuple[dict[str, Any], Path]]) -> None:
             f"fact={metrics['fact_hit_rate']:.2f} "
             f"evidence={metrics['structured_evidence_rate']:.2f} "
             f"export={report['export_check']['status']} "
+            f"question_volume={report['question_volume']['status']} "
             f"auto_rerun={report['auto_rerun']['status']} "
             f"questions={report['question_lifecycle']['status']} "
             f"checkpoint={report['checkpoint']['status']} "
@@ -196,7 +201,7 @@ def _threshold_check(report: dict[str, Any]) -> dict[str, Any]:
             failures.append(f"{key}={value:.2f} < {minimum:.2f}")
     if report["human_context"].get("hash_differs") is not True:
         failures.append("human_context.hash_differs is not true")
-    for section in ["auto_rerun", "question_lifecycle", "checkpoint", "export_check", "classification", "bom_hierarchy"]:
+    for section in ["auto_rerun", "question_lifecycle", "checkpoint", "export_check", "classification", "question_volume", "bom_hierarchy"]:
         if report[section].get("status") != "ok":
             failures.append(f"{section}.status={report[section].get('status')}")
     if report["ingestion"].get("suspicious_title_only"):
@@ -304,6 +309,7 @@ def _build_report(
     human_context_report: dict[str, Any],
     export_report: dict[str, Any],
     classification_report: dict[str, Any],
+    question_volume_report: dict[str, Any],
     bom_hierarchy_report: dict[str, Any],
     auto_rerun_report: dict[str, Any],
     question_lifecycle_report: dict[str, Any],
@@ -369,6 +375,7 @@ def _build_report(
         "checkpoint": checkpoint_report,
         "export_check": export_report,
         "classification": classification_report,
+        "question_volume": question_volume_report,
         "bom_hierarchy": bom_hierarchy_report,
         "matches": matches,
         "false_positives": false_positives,
@@ -1018,7 +1025,7 @@ def _run_export_check() -> dict[str, Any]:
                 "信息成熟度",
                 "来源与依据",
             ],
-            "question_rows_exist": len(question_rows) >= 3,
+            "question_rows_exist": len(question_rows) == 3,
             "classification_fields_exported": any(row[0] == "兜底证据物料" and row[5] for row in main_ws.iter_rows(min_row=2, values_only=True)),
             "evidence_headers_ok": evidence_headers == EVIDENCE_HEADERS,
             "structured_row_exists": any(row[0] == "结构化证据物料" and row[4] == "PRD" and row[7] == 12 for row in evidence_rows),
@@ -1090,6 +1097,49 @@ def _run_classification_check() -> dict[str, Any]:
         "classification_basis_has_bom_path": "路径" in performance.classification_basis and "透光罩组件" in performance.classification_basis,
         "unknown_not_fabricated": unknown.primary_owner == "待确认" or unknown.material_attribute == "待确认",
         "unknown_missing_info": "对应BOM物料确认" in unknown.missing_information,
+    }
+    return {"status": "ok" if all(checks.values()) else "failed", **checks}
+
+
+def _run_question_volume_check() -> dict[str, Any]:
+    """验证大量风险不会膨胀成大量 UI 待确认问题。"""
+
+    state = ProjectState(config=ProjectConfig(project_name="eval-question-volume", bom_path="mock.xlsx"))
+    risks = [
+        RiskItem(
+            id=f"risk-{index}",
+            material_name=f"风险物料{index}",
+            risk_type="供应资源风险" if index % 2 else "定制工艺风险",
+            risk_reason="验证问题控量。",
+            source_basis="mock",
+        )
+        for index in range(15)
+    ]
+    state.risks = risks
+    noisy_questions: list[Question] = []
+    for risk in risks:
+        for topic in ["规格状态", "样件数量", "到样时间", "供应商能力", "验收要求", "BOM对应"]:
+            noisy_questions.append(
+                create_question(
+                    question_kind="procurement_confirmation",
+                    input_type="textarea",
+                    title=f"确认{risk.material_name}{topic}",
+                    message=f"请确认{risk.material_name}的{topic}。",
+                    related_risk_ids=[risk.id],
+                    context={"material_name": risk.material_name, "source_excerpt": topic},
+                    required=True,
+                    blocking=False,
+                )
+            )
+    state.questions = noisy_questions
+    removed_count = compact_project_questions(state)
+    source_questions = limit_source_questions(noisy_questions)
+    checks = {
+        "risk_count_unchanged": len(state.risks) == 15,
+        "pending_question_capped": len([question for question in state.questions if question.status == "pending"]) <= 5,
+        "nonblocking_not_required": all(not question.required for question in state.questions if not question.blocking),
+        "removed_redundant_questions": removed_count >= 85,
+        "source_questions_limited": len(source_questions) <= 2,
     }
     return {"status": "ok" if all(checks.values()) else "failed", **checks}
 

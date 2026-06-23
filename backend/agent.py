@@ -27,6 +27,7 @@ from .parsers.bom_parser import parse_bom
 from .parsers.document_ingestor import ingest_document
 from .parsers.drawing_parser import parse_drawing_folder
 from .parsers.rd_risk_parser import parse_rd_risk_excel
+from .question_governor import compact_project_questions, limit_source_questions
 from .risk_classification import classify_risks, ensure_risk_classification
 from .risk_rules import (
     build_questions,
@@ -379,6 +380,7 @@ def _node_extract_risks(state: AgentState) -> AgentState:
     for extractor in extractors:
         source_risks, source_questions = extractor()
         risks.extend(source_risks)
+        source_questions = limit_source_questions(source_questions)
         upsert_result = _upsert_questions(project, source_questions)
         generated_questions.extend(upsert_result["added"])
         generated_questions.extend(upsert_result["refreshed"])
@@ -468,9 +470,12 @@ def _node_build_risk_questions(state: AgentState) -> AgentState:
     project.risks = risks
     upsert_result = _upsert_questions(project, questions)
     cleaned_count = _remove_stale_risk_action_questions(project)
+    compacted_count = compact_project_questions(project)
     _append_question_upsert_log(project, upsert_result, "风险确认")
     if cleaned_count:
         append_log(project, f"已清理过期风险确认问题 {cleaned_count} 个。")
+    if compacted_count:
+        append_log(project, f"已隐藏非关键待确认问题 {compacted_count} 个，详细补充项保留在 Excel。")
     append_log(project, f"待人工确认问题 {len(project.questions)} 个。")
     save_project(project)
     return {
@@ -550,6 +555,7 @@ def _prepare_question_state(project: ProjectState) -> None:
     sync_all_question_keys(project)
     ensure_decisions_from_completed_questions(project)
     suppress_questions_by_decisions(project)
+    compact_project_questions(project)
 
 
 def _thread_id(project: ProjectState) -> str:

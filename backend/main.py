@@ -38,6 +38,7 @@ from .question_engine import (
     apply_question_effect,
     pending_required_questions,
 )
+from .question_governor import compact_project_questions
 from .storage import append_log, list_projects, load_project, project_dir, save_project
 
 
@@ -343,9 +344,10 @@ def _cleanup_duplicate_questions_if_needed(state: ProjectState) -> None:
     sync_all_question_keys(state)
     suppress_questions_by_decisions(state)
     removed_count = _dedupe_existing_questions(state)
+    removed_count += compact_project_questions(state)
     if not removed_count:
         return
-    append_log(state, f"已合并重复确认问题 {removed_count} 个。")
+    append_log(state, f"已合并或隐藏非关键确认问题 {removed_count} 个。")
     save_project(state)
 
 

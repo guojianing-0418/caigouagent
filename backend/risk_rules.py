@@ -174,6 +174,9 @@ RISK_JSON_SCHEMA = """
 如模型只支持旧格式，也可以返回风险数组，系统会自动兼容。
 
 questions 的 blocking / required 必须按以下规则判断：
+- questions 只用于少量关键人工判断，不要把每条风险的常规补齐项都写成问题。
+- 普通补充信息（样件数量、到样时间、规格状态、供应商成熟度、验收要求等）写入 risk.unresolved_questions 或后续 Excel 字段，不要生成 Question。
+- 每个来源最多生成 2 个非阻塞问题；能合并成一个问题就合并。
 - blocking=true 只用于“采购不立即回答，Agent 就无法继续正确执行”的问题。
 - blocking=true 的典型场景：
   1. 无法继续读取来源，例如必须选择正确飞书群；

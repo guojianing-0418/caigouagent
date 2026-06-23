@@ -126,20 +126,18 @@ def _append_question_distribution_sheet(wb: Workbook, risks: list[RiskItem]) -> 
     _style_header(ws)
 
     for risk in _sort_risks_for_main_sheet(risks):
-        questions = risk.followup_questions or [""]
-        for question in questions:
-            ws.append(
-                [
-                    risk.material_name,
-                    risk.risk_type,
-                    risk.primary_owner,
-                    risk.suggested_question_owner,
-                    question,
-                    _join_multi(risk.missing_information),
-                    risk.information_maturity,
-                    risk.source_basis,
-                ]
-            )
+        ws.append(
+            [
+                risk.material_name,
+                risk.risk_type,
+                risk.primary_owner,
+                risk.suggested_question_owner,
+                _join_multi(risk.followup_questions),
+                _join_multi(risk.missing_information),
+                risk.information_maturity,
+                risk.source_basis,
+            ]
+        )
 
     _style_body(ws, [24, 20, 14, 24, 70, 50, 20, 80])
 

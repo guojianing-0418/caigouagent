@@ -444,33 +444,35 @@ def _followup_questions(
 ) -> list[str]:
     name = risk.material_name or "该物料"
     scope = _material_scope(material)
-    questions: list[str] = []
-    if owner == OWNER_STRUCTURE:
-        questions.append(f"请结构确认“{name}”{scope}的图纸/规格是否已冻结，哪些版本可以发供应商预评估？")
-        if {"开模", "关键尺寸", "防水", "盐雾", "材料", "表面处理", "装配匹配"} & set(tags):
-            questions.append(f"请结构说明“{name}”是否涉及开模、关键尺寸、材料/表面处理、防水盐雾或装配匹配要求。")
-    elif owner == OWNER_ELECTRONICS:
-        questions.append(f"请电子确认“{name}”{scope}是否为新选型，是否已有 AVL、替代料和成熟供应商。")
-        if {"认证资料", "通信法规", "电池法规", "PCBA", "芯片"} & set(tags):
-            questions.append(f"请电子确认“{name}”是否影响认证、通信/电池法规、PCBA测试或替代料验证。")
-    elif owner == OWNER_PROCESS:
-        questions.append(f"请工艺确认“{name}”{scope}是否需要外协工艺、DFM、工装、治具或检具提前评估。")
-        if {"良率", "一致性", "低压注塑", "委外加工"} & set(tags):
-            questions.append(f"请工艺确认“{name}”样机阶段使用临时工艺还是正式工艺，良率和一致性风险在哪里。")
-    elif owner == OWNER_PROCUREMENT:
-        questions.append(f"请寻源采购确认“{name}”{scope}是否已有成熟供应商，交期、MOQ、报价和二供是否有风险。")
-        if {"新供应商", "供方能力", "长周期", "齐套交付"} & set(tags):
-            questions.append(f"请采购确认供应商此前是否做过类似“{name}”，是否需要提前审厂、DFM或备选供应商。")
-    else:
-        questions.append(f"请主设计先确认“{name}”的归口负责人、物料属性、图纸/规格状态和采购前置要求。")
-
+    object_hint = ""
     if material and material.has_children:
-        questions.append(f"“{name}”是BOM中的{material.item_role}，请确认风险是作用于该组件整体，还是需要下钻到其下级具体物料。")
+        object_hint = "，并说明风险作用于该组件整体还是需要下钻到下级具体物料"
+
+    if owner == OWNER_STRUCTURE:
+        core = f"请结构确认“{name}”{scope}的图纸/规格状态、关键尺寸/材料/表面处理要求，以及哪些版本可以发供应商预评估"
+        if {"开模", "关键尺寸", "防水", "盐雾", "材料", "表面处理", "装配匹配"} & set(tags):
+            core += "，重点说明开模、防水盐雾或装配匹配影响"
+    elif owner == OWNER_ELECTRONICS:
+        core = f"请电子确认“{name}”{scope}是否为新选型，是否已有 AVL、替代料和成熟供应商"
+        if {"认证资料", "通信法规", "电池法规", "PCBA", "芯片"} & set(tags):
+            core += "，并说明认证、法规、PCBA测试或替代料验证影响"
+    elif owner == OWNER_PROCESS:
+        core = f"请工艺确认“{name}”{scope}是否需要外协工艺、DFM、工装、治具或检具提前评估"
+        if {"良率", "一致性", "低压注塑", "委外加工"} & set(tags):
+            core += "，并说明样机阶段工艺方案、良率和一致性风险"
+    elif owner == OWNER_PROCUREMENT:
+        core = f"请寻源采购确认“{name}”{scope}是否已有成熟供应商，交期、MOQ、报价和二供是否有风险"
+        if {"新供应商", "供方能力", "长周期", "齐套交付"} & set(tags):
+            core += "，并说明是否需要提前审厂、DFM或备选供应商"
+    else:
+        core = f"请主设计先确认“{name}”的归口负责人、物料属性、图纸/规格状态和采购前置要求"
+
     if confirmation_method == CONFIRM_JOINT:
-        questions.append(f"“{name}”同时涉及研发定义和采购/供应商能力，请主设计、工艺和寻源采购一起确认前置动作。")
+        core += "，必要时由主设计、工艺和寻源采购共同确认前置动作"
+    core += object_hint
     if material_attribute == UNKNOWN or missing_info:
-        questions.append(f"请补齐“{name}”的{_join_cn(missing_info[:5])}，用于采购预评估和样件准备。")
-    return _dedupe(questions)
+        core += f"；同时补齐{_join_cn(missing_info[:5])}"
+    return [core.rstrip("，；。") + "。"]
 
 
 def _classification_basis(

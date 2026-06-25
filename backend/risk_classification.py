@@ -29,8 +29,8 @@ MAT_OUTSOURCED = "外购件"
 MAT_PROCESSING = "委外加工件"
 
 MATURITY_CLEAR = "已有明确依据"
-MATURITY_WEAK = "依据较弱，需确认"
-MATURITY_POTENTIAL = "仅为潜在风险，需补充资料"
+MATURITY_WEAK = "计划阶段待补充"
+MATURITY_POTENTIAL = "计划阶段待补充"
 
 
 @dataclass(frozen=True)
@@ -262,8 +262,8 @@ def _fallback_classification(risk: RiskItem, reason: str) -> RiskItem:
     risk.material_attribute = risk.material_attribute or UNKNOWN
     risk.information_maturity = risk.information_maturity or MATURITY_POTENTIAL
     risk.suggested_question_owner = risk.suggested_question_owner or "项目采购代表先确认主设计/采购归口"
-    risk.followup_questions = risk.followup_questions or [f"请确认“{risk.material_name or '该物料'}”的风险归口、规格状态、样件需求和采购前置要求。"]
-    risk.missing_information = risk.missing_information or ["对应BOM物料确认", "主归口", "物料属性", "图纸/规格状态", "样件数量", "到样时间", "验收要求"]
+    risk.followup_questions = risk.followup_questions or [f"请主设计确认“{risk.material_name or '该物料'}”在计划阶段是否需要提前关注。"]
+    risk.missing_information = risk.missing_information or ["对应BOM物料确认", "风险物料识别清单", "初步物料清单", "关键件选型/风险说明"]
     risk.classification_basis = risk.classification_basis or reason
     return risk
 
@@ -390,8 +390,6 @@ def _information_maturity(risk: RiskItem, material: MaterialRecord | None) -> st
     has_open_questions = bool(risk.unresolved_questions)
     if has_evidence and has_material and not has_open_questions:
         return MATURITY_CLEAR
-    if has_evidence and has_material:
-        return MATURITY_WEAK
     return MATURITY_POTENTIAL
 
 
@@ -414,23 +412,40 @@ def _missing_information(risk: RiskItem, material: MaterialRecord | None, tags: 
     text = _risk_text(risk, material)
     if not material or risk.material_name in {"待确认物料", "未知物料", ""}:
         missing.append("对应BOM物料确认")
-    if material_attribute in {MAT_CUSTOM, MAT_PROCESSING, MAT_SPECIAL_STANDARD} and "图纸" not in text:
-        missing.append("可发供应商评估的图纸/规格版本")
-    if material and not material.spec:
-        missing.append("规格型号")
-    if material and not material.material and {"材料", "盐雾", "表面处理", "强度"} & set(tags):
-        missing.append("材质/表面处理要求")
-    if {"样件数量未明确", "到样时间未明确"} & set(tags) or "样" in text:
-        missing.extend(["样件数量", "到样时间"])
-    else:
-        missing.extend(["样件数量", "到样时间"])
-    if {"验收要求未明确", "来料合格率", "检验规范", "可靠性", "测试不过"} & set(tags):
-        missing.append("采购验收/测试要求")
-    if {"新供应商", "供方能力", "二供验证", "长周期", "齐套交付"} & set(tags):
-        missing.extend(["成熟供应商/备选供应商", "供应商评估周期"])
-    if {"开模", "DFM", "工装", "检具"} & set(tags):
-        missing.extend(["DFM评估结论", "工装/检具需求"])
+    if "风险物料识别清单" not in text:
+        missing.append("风险物料识别清单")
+    if "长周期" in text or {"长周期", "齐套交付"} & set(tags):
+        missing.append("长周期风险物料确认")
+    if {"DFM", "PFMEA", "可靠性"} & set(tags) or "dfmea" in text:
+        missing.append("概要设计DFMEA")
+    if owner_hint := _plan_material_list_hint(risk, material, tags):
+        missing.append(owner_hint)
+    if material_attribute in {MAT_CUSTOM, MAT_PROCESSING, MAT_SPECIAL_STANDARD} or {"关键尺寸", "开模", "材料", "表面处理"} & set(tags):
+        missing.append("初步零部件图纸/关键尺寸")
+    if {"PCBA", "芯片", "AVL", "替代料"} & set(tags):
+        missing.append("电子关键件选型/风险说明")
+    if {"PCBA"} & set(tags):
+        missing.append("PCBA测试工装初始需求")
+    if {"DFM", "委外加工", "低压注塑"} & set(tags):
+        missing.append("机加工可行性/整机DFM")
+    if {"工装", "检具", "来料合格率"} & set(tags):
+        missing.append("检具初始需求")
+    if {"认证", "认证资料", "通信法规", "电池法规"} & set(tags):
+        missing.append("产品认证清单/法规合规需求")
+    if {"样件数量未明确", "到样时间未明确"} & set(tags) or "样" in text or "齐套" in text:
+        missing.append("原理样机物料采购进度/齐套信息")
     return _dedupe(missing)
+
+
+def _plan_material_list_hint(risk: RiskItem, material: MaterialRecord | None, tags: list[str]) -> str:
+    text = _risk_text(risk, material)
+    if {"PCBA", "芯片", "AVL", "替代料", "认证资料", "通信法规", "电池法规"} & set(tags) or _score(text, ELECTRONICS_HINTS):
+        return "初步电子物料清单"
+    if {"关键尺寸", "开模", "材料", "表面处理", "装配匹配", "防水", "盐雾"} & set(tags) or _score(text, STRUCTURE_HINTS):
+        return "初步结构物料清单"
+    if material:
+        return "初步物料清单"
+    return ""
 
 
 def _followup_questions(
@@ -443,36 +458,23 @@ def _followup_questions(
     missing_info: list[str],
 ) -> list[str]:
     name = risk.material_name or "该物料"
-    scope = _material_scope(material)
-    object_hint = ""
+    missing = _join_cn(missing_info[:3])
+    suffix = f"，并补充{missing}" if missing else ""
     if material and material.has_children:
-        object_hint = "，并说明风险作用于该组件整体还是需要下钻到下级具体物料"
+        suffix += "，说明影响组件整体还是下级物料"
 
     if owner == OWNER_STRUCTURE:
-        core = f"请结构确认“{name}”{scope}的图纸/规格状态、关键尺寸/材料/表面处理要求，以及哪些版本可以发供应商预评估"
-        if {"开模", "关键尺寸", "防水", "盐雾", "材料", "表面处理", "装配匹配"} & set(tags):
-            core += "，重点说明开模、防水盐雾或装配匹配影响"
+        core = f"请结构确认“{name}”是否是计划阶段需要提前关注的结构风险{suffix}。"
     elif owner == OWNER_ELECTRONICS:
-        core = f"请电子确认“{name}”{scope}是否为新选型，是否已有 AVL、替代料和成熟供应商"
-        if {"认证资料", "通信法规", "电池法规", "PCBA", "芯片"} & set(tags):
-            core += "，并说明认证、法规、PCBA测试或替代料验证影响"
+        core = f"请电子确认“{name}”是否是计划阶段需要提前关注的电子风险{suffix}。"
     elif owner == OWNER_PROCESS:
-        core = f"请工艺确认“{name}”{scope}是否需要外协工艺、DFM、工装、治具或检具提前评估"
-        if {"良率", "一致性", "低压注塑", "委外加工"} & set(tags):
-            core += "，并说明样机阶段工艺方案、良率和一致性风险"
+        core = f"请工艺/质量确认“{name}”是否需要在计划阶段提前做可行性、DFM或检具判断{suffix}。"
     elif owner == OWNER_PROCUREMENT:
-        core = f"请寻源采购确认“{name}”{scope}是否已有成熟供应商，交期、MOQ、报价和二供是否有风险"
-        if {"新供应商", "供方能力", "长周期", "齐套交付"} & set(tags):
-            core += "，并说明是否需要提前审厂、DFM或备选供应商"
+        core = f"请采购确认“{name}”在计划阶段是否存在长周期、齐套或供方能力风险{suffix}。"
     else:
-        core = f"请主设计先确认“{name}”的归口负责人、物料属性、图纸/规格状态和采购前置要求"
+        core = f"请主设计确认“{name}”是否应纳入计划阶段风险物料清单{suffix}。"
 
-    if confirmation_method == CONFIRM_JOINT:
-        core += "，必要时由主设计、工艺和寻源采购共同确认前置动作"
-    core += object_hint
-    if material_attribute == UNKNOWN or missing_info:
-        core += f"；同时补齐{_join_cn(missing_info[:5])}"
-    return [core.rstrip("，；。") + "。"]
+    return [core]
 
 
 def _classification_basis(

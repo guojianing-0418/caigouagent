@@ -16,23 +16,18 @@ from .risk_classification import ensure_risk_classification
 
 BASE_EXPORT_HEADERS = ["风险物料名称", "所属模块", "风险类型", "风险原因", "来源与依据"]
 CLASSIFICATION_HEADERS = [
-    "风险确认方式",
     "主归口",
     "物料属性",
-    "风险标签",
     "信息成熟度",
-    "建议提问对象",
-    "可发群问题",
+    "提问问题",
     "需要补齐的信息",
-    "分类依据",
 ]
 EXPORT_HEADERS = BASE_EXPORT_HEADERS + CLASSIFICATION_HEADERS
 QUESTION_DISTRIBUTION_HEADERS = [
     "风险物料名称",
     "风险类型",
     "主归口",
-    "建议提问对象",
-    "可发群问题",
+    "提问问题",
     "需要补齐的信息",
     "信息成熟度",
     "来源与依据",
@@ -79,19 +74,15 @@ def export_risks(project_id: str, project_name: str, risks: list[RiskItem]) -> P
                 risk.risk_type,
                 risk.risk_reason,
                 risk.source_basis,
-                risk.risk_confirmation_method,
                 risk.primary_owner,
                 risk.material_attribute,
-                _join_multi(risk.risk_tags),
                 risk.information_maturity,
-                risk.suggested_question_owner,
                 _join_multi(risk.followup_questions),
                 _join_multi(risk.missing_information),
-                risk.classification_basis,
             ]
         )
 
-    _style_body(ws, [24, 22, 20, 44, 80, 16, 14, 16, 36, 20, 24, 60, 50, 70])
+    _style_body(ws, [24, 22, 20, 44, 80, 14, 16, 20, 60, 50])
     _merge_same_material_cells(ws)
     _append_question_distribution_sheet(wb, risks)
     _append_evidence_sheet(wb, risks)
@@ -131,7 +122,6 @@ def _append_question_distribution_sheet(wb: Workbook, risks: list[RiskItem]) -> 
                 risk.material_name,
                 risk.risk_type,
                 risk.primary_owner,
-                risk.suggested_question_owner,
                 _join_multi(risk.followup_questions),
                 _join_multi(risk.missing_information),
                 risk.information_maturity,
@@ -139,7 +129,7 @@ def _append_question_distribution_sheet(wb: Workbook, risks: list[RiskItem]) -> 
             ]
         )
 
-    _style_body(ws, [24, 20, 14, 24, 70, 50, 20, 80])
+    _style_body(ws, [24, 20, 14, 70, 50, 20, 80])
 
 
 def _append_evidence_sheet(wb: Workbook, risks: list[RiskItem]) -> None:

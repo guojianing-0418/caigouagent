@@ -1019,14 +1019,15 @@ def _run_export_check() -> dict[str, Any]:
                 "风险物料名称",
                 "风险类型",
                 "主归口",
-                "建议提问对象",
-                "可发群问题",
+                "提问问题",
                 "需要补齐的信息",
                 "信息成熟度",
                 "来源与依据",
             ],
             "question_rows_exist": len(question_rows) == 3,
             "classification_fields_exported": any(row[0] == "兜底证据物料" and row[5] for row in main_ws.iter_rows(min_row=2, values_only=True)),
+            "removed_leader_hidden_headers": all(header not in main_headers for header in ["风险确认方式", "风险标签", "建议提问对象", "分类依据", "可发群问题"]),
+            "question_header_renamed": "提问问题" in main_headers and "提问问题" in question_headers,
             "evidence_headers_ok": evidence_headers == EVIDENCE_HEADERS,
             "structured_row_exists": any(row[0] == "结构化证据物料" and row[4] == "PRD" and row[7] == 12 for row in evidence_rows),
             "fallback_row_exists": any(row[0] == "兜底证据物料" and row[4] == "来源与依据" and "轴心为定制加工件" in str(row[10] or "") for row in evidence_rows),
@@ -1092,11 +1093,15 @@ def _run_classification_check() -> dict[str, Any]:
         "long_lead_procurement": long_lead.primary_owner == "采购" and long_lead.risk_confirmation_method == "采购确认",
         "long_lead_tags": "长周期" in long_lead.risk_tags and "齐套交付" in long_lead.risk_tags,
         "custom_process_joint": process.risk_confirmation_method == "协同确认" and process.primary_owner in {"结构", "工艺"},
-        "custom_process_questions": bool(process.followup_questions) and any("图纸" in question or "DFM" in question for question in process.followup_questions),
+        "custom_process_questions": bool(process.followup_questions)
+        and len(process.followup_questions) == 1
+        and "计划阶段" in process.followup_questions[0]
+        and len(process.followup_questions[0]) <= 120,
         "performance_rd_or_joint": performance.risk_confirmation_method in {"研发确认", "协同确认"} and performance.primary_owner in {"电子", "结构"},
         "classification_basis_has_bom_path": "路径" in performance.classification_basis and "透光罩组件" in performance.classification_basis,
         "unknown_not_fabricated": unknown.primary_owner == "待确认" or unknown.material_attribute == "待确认",
         "unknown_missing_info": "对应BOM物料确认" in unknown.missing_information,
+        "weak_maturity_removed": all(risk.information_maturity != "依据较弱，需确认" for risk in classified),
     }
     return {"status": "ok" if all(checks.values()) else "failed", **checks}
 

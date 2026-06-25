@@ -303,28 +303,6 @@ def build_questions(risks: list[RiskItem]) -> list[Question]:
     """
 
     questions: list[Question] = []
-    for risk in risks:
-        if risk.material_name in ["待确认物料", "未知物料", ""]:
-            questions.append(
-                Question(
-                    question_kind="risk_keep_review",
-                    input_type="boolean",
-                    title="这条风险是否保留？",
-                    message=f"物料“{risk.material_name or '待确认物料'}”的风险依据较弱，是否保留在采购风险清单中？",
-                    reason="模型没有明确关联到 BOM 中的具体物料，需要采购确认。",
-                    options=["保留", "删除"],
-                    blocking=False,
-                    required=False,
-                    context={
-                        "risk_id": risk.id,
-                        "material_name": risk.material_name,
-                        "risk_type": risk.risk_type,
-                        "source_excerpt": risk.source_basis,
-                        "effect": "remove_related_risks_when_false",
-                    },
-                    related_risk_ids=[risk.id],
-                )
-            )
 
     for i, left in enumerate(risks):
         for right in risks[i + 1 :]:

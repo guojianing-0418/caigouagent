@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from backend.fact_rules import extract_document_facts, format_facts_for_prompt
+from backend import lark_client
 from backend.exporter import EVIDENCE_HEADERS, EXPORT_HEADERS, export_risks
 from backend.agent import _dedupe_existing_questions, _question_signature, _remove_stale_risk_action_questions, _upsert_questions
 from backend.main import _build_export_check, _should_auto_rerun_after_answer
@@ -105,6 +107,7 @@ def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
     auto_rerun_report = _run_auto_rerun_check()
     question_lifecycle_report = _run_question_lifecycle_check()
     checkpoint_report = _run_checkpoint_smoke_check()
+    lark_readonly_report = _run_lark_readonly_check()
 
     if mode == "mock":
         risks, questions, facts = _run_mock(case, materials)
@@ -132,6 +135,7 @@ def _run_case(case_path: Path, mode: str) -> tuple[dict[str, Any], Path]:
         auto_rerun_report,
         question_lifecycle_report,
         checkpoint_report,
+        lark_readonly_report,
     )
     report["thresholds"] = _threshold_check(report) if mode == "mock" else {"status": "skipped", "failures": []}
     report_path = _write_report(case["case_name"], mode, report)
@@ -157,6 +161,7 @@ def _print_case_summary(report: dict[str, Any], report_path: Path) -> bool:
     print(f"auto_rerun_check: {report['auto_rerun']['status']}")
     print(f"question_lifecycle_check: {report['question_lifecycle']['status']}")
     print(f"checkpoint_check: {report['checkpoint']['status']}")
+    print(f"lark_readonly_check: {report['lark_readonly']['status']}")
     print(f"export_check: {report['export_check']['status']}")
     print(f"classification_check: {report['classification']['status']}")
     print(f"question_volume_check: {report['question_volume']['status']}")
@@ -186,6 +191,7 @@ def _print_batch_summary(reports: list[tuple[dict[str, Any], Path]]) -> None:
             f"auto_rerun={report['auto_rerun']['status']} "
             f"questions={report['question_lifecycle']['status']} "
             f"checkpoint={report['checkpoint']['status']} "
+            f"lark_readonly={report['lark_readonly']['status']} "
             f"thresholds={report['thresholds']['status']}"
         )
 
@@ -201,7 +207,7 @@ def _threshold_check(report: dict[str, Any]) -> dict[str, Any]:
             failures.append(f"{key}={value:.2f} < {minimum:.2f}")
     if report["human_context"].get("hash_differs") is not True:
         failures.append("human_context.hash_differs is not true")
-    for section in ["auto_rerun", "question_lifecycle", "checkpoint", "export_check", "classification", "question_volume", "bom_hierarchy"]:
+    for section in ["auto_rerun", "question_lifecycle", "checkpoint", "lark_readonly", "export_check", "classification", "question_volume", "bom_hierarchy"]:
         if report[section].get("status") != "ok":
             failures.append(f"{section}.status={report[section].get('status')}")
     if report["ingestion"].get("suspicious_title_only"):
@@ -314,6 +320,7 @@ def _build_report(
     auto_rerun_report: dict[str, Any],
     question_lifecycle_report: dict[str, Any],
     checkpoint_report: dict[str, Any],
+    lark_readonly_report: dict[str, Any],
 ) -> dict[str, Any]:
     """计算召回、误报、类型准确率和证据命中率。"""
 
@@ -373,6 +380,7 @@ def _build_report(
         "auto_rerun": auto_rerun_report,
         "question_lifecycle": question_lifecycle_report,
         "checkpoint": checkpoint_report,
+        "lark_readonly": lark_readonly_report,
         "export_check": export_report,
         "classification": classification_report,
         "question_volume": question_volume_report,
@@ -951,6 +959,107 @@ def _run_checkpoint_smoke_check() -> dict[str, Any]:
     return {"status": "ok" if all(checks.values()) else "failed", **checks}
 
 
+def _run_lark_readonly_check() -> dict[str, Any]:
+    """验证飞书群聊链接展开遵循只读/预览策略，不回退到原文件下载/导出。"""
+
+    source = (ROOT / "backend" / "lark_client.py").read_text(encoding="utf-8")
+    forbidden_fragments = ["--download-resources", "\"+export\"", "\"+download\"", "\"+media-download\""]
+    calls: list[list[str]] = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        resource_dir = Path(tmpdir)
+
+        def fake_run_lark(args: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
+            calls.append(args)
+            if args[:2] == ["drive", "+inspect"]:
+                url = args[args.index("--url") + 1]
+                if "denied-token" in url:
+                    data = {"type": "file", "token": "denied-token", "title": "无权限附件"}
+                elif "/docx/" in url:
+                    data = {"type": "docx", "token": "doc-token", "title": "风险周报"}
+                elif "/sheets/" in url:
+                    data = {"type": "sheet", "token": "sheet-token", "title": "风险台账"}
+                elif "/drive/file/" in url:
+                    data = {"type": "file", "token": "file-token", "title": "预览附件.pdf"}
+                elif "/slides/" in url:
+                    data = {"type": "slides", "token": "slides-token", "title": "计划评审PPT"}
+                else:
+                    data = {"type": "file", "token": "file-token", "title": "预览附件.pdf"}
+                return 0, json.dumps({"ok": True, "data": data}, ensure_ascii=False), ""
+            if args[:2] == ["docs", "+fetch"]:
+                content = '<title>风险周报</title><p>轴心公差未冻结</p><img token="img-token" name="风险截图.png"/><sheet token="embedded-sheet"/>'
+                return 0, json.dumps({"ok": True, "data": {"document": {"content": content}}}, ensure_ascii=False), ""
+            if args[:2] == ["docs", "+media-preview"]:
+                output = resource_dir / args[args.index("--output") + 1]
+                output = output.with_suffix(".txt")
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text("图片预览文字：供应商交期 12 周", encoding="utf-8")
+                return 0, json.dumps({"ok": True, "data": {"output_path": str(output)}}, ensure_ascii=False), ""
+            if args[:2] == ["sheets", "+workbook-info"]:
+                data = {"sheets": [{"sheet_id": "sid1", "title": "风险清单", "row_count": 20, "column_count": 6, "is_hidden": False}]}
+                return 0, json.dumps({"ok": True, "data": data}, ensure_ascii=False), ""
+            if args[:2] == ["sheets", "+csv-get"]:
+                data = {"annotated_csv": "[row=1] 物料,风险\n[row=2] 轴心,热处理未冻结", "current_region": "A1:F20"}
+                return 0, json.dumps({"ok": True, "data": data}, ensure_ascii=False), ""
+            if args[:2] == ["slides", "xml_presentations"]:
+                data = {"xml_presentation": {"content": "<presentation><slide><p>PPT里提到长周期芯片</p></slide></presentation>"}}
+                return 0, json.dumps({"ok": True, "data": data}, ensure_ascii=False), ""
+            if args[:2] == ["drive", "+preview"] and "--list-only" in args:
+                if args[args.index("--file-token") + 1] == "denied-token":
+                    return 1, "", "permission denied"
+                data = {"mode": "list", "candidates": [{"type": "text", "status": "READY", "downloadable": True}]}
+                return 0, json.dumps({"ok": True, "data": data}, ensure_ascii=False), ""
+            if args[:2] == ["drive", "+preview"]:
+                output = resource_dir / args[args.index("--output") + 1]
+                output = output.with_suffix(".txt")
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text("云盘预览文字：Excel附件含成本风险", encoding="utf-8")
+                return 0, json.dumps({"ok": True, "data": {"output_path": str(output)}}, ensure_ascii=False), ""
+            return 1, "", f"unexpected call: {args}"
+
+        original_run_lark = lark_client._run_lark
+        try:
+            lark_client._run_lark = fake_run_lark
+            stats = lark_client._new_enrichment_stats()
+            logs: list[str] = []
+            doc_text = lark_client._text_from_lark_url("https://example.feishu.cn/docx/doc-token", resource_dir, logs, stats)
+            sheet_text = lark_client._text_from_lark_url("https://example.feishu.cn/sheets/sheet-token", resource_dir, logs, stats)
+            file_text = lark_client._text_from_lark_url("https://example.feishu.cn/drive/file/file-token", resource_dir, logs, stats)
+            slides_text = lark_client._text_from_lark_url("https://example.feishu.cn/slides/slides-token", resource_dir, logs, stats)
+            denied_text = lark_client._text_from_lark_url("https://example.feishu.cn/drive/file/denied-token", resource_dir, logs, stats)
+        finally:
+            lark_client._run_lark = original_run_lark
+
+    forbidden_calls = [
+        args
+        for args in calls
+        if "--download-resources" in args
+        or "+export" in args
+        or "+download" in args
+        or "+media-download" in args
+    ]
+    checks = {
+        "source_has_no_forbidden_commands": all(fragment not in source for fragment in forbidden_fragments),
+        "runtime_has_no_forbidden_calls": not forbidden_calls,
+        "doc_fetch_used": any(args[:2] == ["docs", "+fetch"] for args in calls),
+        "doc_media_preview_used": any(args[:2] == ["docs", "+media-preview"] for args in calls),
+        "sheet_read_api_used": any(args[:2] == ["sheets", "+workbook-info"] for args in calls) and any(args[:2] == ["sheets", "+csv-get"] for args in calls),
+        "drive_preview_used": sum(1 for args in calls if args[:2] == ["drive", "+preview"]) >= 2,
+        "slides_xml_used": any(args[:3] == ["slides", "xml_presentations", "get"] for args in calls),
+        "permission_denied_no_request": stats["permission_denied_no_request"] == 1 and denied_text == "",
+        "read_and_preview_stats": stats["read_success"] >= 3 and stats["preview_success"] >= 2,
+        "content_enriched": all(
+            text
+            for text in [doc_text, sheet_text, file_text, slides_text]
+        )
+        and "轴心公差未冻结" in doc_text
+        and "热处理未冻结" in sheet_text
+        and "成本风险" in file_text
+        and "长周期芯片" in slides_text,
+    }
+    return {"status": "ok" if all(checks.values()) else "failed", **checks, "forbidden_calls": forbidden_calls, "logs": logs[:8]}
+
+
 def _run_export_check() -> dict[str, Any]:
     """验证导出工作簿主表、问题分发清单和证据详情页可用。"""
 
@@ -1020,12 +1129,12 @@ def _run_export_check() -> dict[str, Any]:
                 "风险类型",
                 "主归口",
                 "提问问题",
-                "需要补齐的信息",
                 "信息成熟度",
                 "来源与依据",
             ],
             "question_rows_exist": len(question_rows) == 3,
             "classification_fields_exported": any(row[0] == "兜底证据物料" and row[5] for row in main_ws.iter_rows(min_row=2, values_only=True)),
+            "missing_info_hidden": "需要补齐的信息" not in main_headers and "需要补齐的信息" not in question_headers,
             "removed_leader_hidden_headers": all(header not in main_headers for header in ["风险确认方式", "风险标签", "建议提问对象", "分类依据", "可发群问题"]),
             "question_header_renamed": "提问问题" in main_headers and "提问问题" in question_headers,
             "evidence_headers_ok": evidence_headers == EVIDENCE_HEADERS,
@@ -1082,12 +1191,20 @@ def _run_classification_check() -> dict[str, Any]:
             risk_reason="资料中提到接口匹配风险，但未对应到 BOM 物料。",
             source_basis="群聊：接口件待确认。",
         ),
+        RiskItem(
+            material_name="标准螺钉",
+            module="结构",
+            risk_type="质量验证风险",
+            risk_reason="标准螺钉已有明确规格和来源依据。",
+            source_basis="BOM：标准螺钉使用通用规格。",
+        ),
     ]
     classified = classify_risks(risks, materials)
     long_lead = classified[0]
     process = classified[1]
     performance = classified[2]
     unknown = classified[3]
+    non_priority_clear = classified[4]
     checks = {
         "risk_count_unchanged": len(classified) == len(risks),
         "long_lead_procurement": long_lead.primary_owner == "采购" and long_lead.risk_confirmation_method == "采购确认",
@@ -1095,12 +1212,22 @@ def _run_classification_check() -> dict[str, Any]:
         "custom_process_joint": process.risk_confirmation_method == "协同确认" and process.primary_owner in {"结构", "工艺"},
         "custom_process_questions": bool(process.followup_questions)
         and len(process.followup_questions) == 1
-        and "计划阶段" in process.followup_questions[0]
+        and "轴心需要按图加工" in process.followup_questions[0]
+        and "重点确认" in process.followup_questions[0]
+        and "并补充" not in process.followup_questions[0]
+        and "初步" not in process.followup_questions[0]
         and len(process.followup_questions[0]) <= 120,
         "performance_rd_or_joint": performance.risk_confirmation_method in {"研发确认", "协同确认"} and performance.primary_owner in {"电子", "结构"},
+        "priority_question_reason_driven": "功率精度和校准一致性" in performance.followup_questions[0] and "关键性能指标" in performance.followup_questions[0],
         "classification_basis_has_bom_path": "路径" in performance.classification_basis and "透光罩组件" in performance.classification_basis,
         "unknown_not_fabricated": unknown.primary_owner == "待确认" or unknown.material_attribute == "待确认",
         "unknown_missing_info": "对应BOM物料确认" in unknown.missing_information,
+        "non_priority_clear_no_question": non_priority_clear.followup_questions == ["无需提问"],
+        "questions_do_not_include_missing_info": all(
+            "并补充" not in question and "初步物料清单" not in question and "概要设计DFMEA" not in question
+            for risk in classified
+            for question in risk.followup_questions
+        ),
         "weak_maturity_removed": all(risk.information_maturity != "依据较弱，需确认" for risk in classified),
     }
     return {"status": "ok" if all(checks.values()) else "failed", **checks}

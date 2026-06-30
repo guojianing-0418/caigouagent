@@ -20,7 +20,6 @@ CLASSIFICATION_HEADERS = [
     "物料属性",
     "信息成熟度",
     "提问问题",
-    "需要补齐的信息",
 ]
 EXPORT_HEADERS = BASE_EXPORT_HEADERS + CLASSIFICATION_HEADERS
 QUESTION_DISTRIBUTION_HEADERS = [
@@ -28,7 +27,6 @@ QUESTION_DISTRIBUTION_HEADERS = [
     "风险类型",
     "主归口",
     "提问问题",
-    "需要补齐的信息",
     "信息成熟度",
     "来源与依据",
 ]
@@ -78,11 +76,10 @@ def export_risks(project_id: str, project_name: str, risks: list[RiskItem]) -> P
                 risk.material_attribute,
                 risk.information_maturity,
                 _join_multi(risk.followup_questions),
-                _join_multi(risk.missing_information),
             ]
         )
 
-    _style_body(ws, [24, 22, 20, 44, 80, 14, 16, 20, 60, 50])
+    _style_body(ws, [24, 22, 20, 44, 80, 14, 16, 20, 70])
     _merge_same_material_cells(ws)
     _append_question_distribution_sheet(wb, risks)
     _append_evidence_sheet(wb, risks)
@@ -123,13 +120,12 @@ def _append_question_distribution_sheet(wb: Workbook, risks: list[RiskItem]) -> 
                 risk.risk_type,
                 risk.primary_owner,
                 _join_multi(risk.followup_questions),
-                _join_multi(risk.missing_information),
                 risk.information_maturity,
                 risk.source_basis,
             ]
         )
 
-    _style_body(ws, [24, 20, 14, 70, 50, 20, 80])
+    _style_body(ws, [24, 20, 14, 80, 20, 80])
 
 
 def _append_evidence_sheet(wb: Workbook, risks: list[RiskItem]) -> None:

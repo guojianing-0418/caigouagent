@@ -31,6 +31,15 @@ MAT_PROCESSING = "委外加工件"
 MATURITY_CLEAR = "已有明确依据"
 MATURITY_WEAK = "计划阶段待补充"
 MATURITY_POTENTIAL = "计划阶段待补充"
+NO_FOLLOWUP_QUESTION = "无需提问"
+
+PRIORITY_QUESTION_RISK_TYPES = {
+    "新物料/新技术风险",
+    "供应资源风险",
+    "长周期风险",
+    "定制工艺风险",
+    "关键性能风险",
+}
 
 
 @dataclass(frozen=True)
@@ -204,7 +213,7 @@ def classify_risk(risk: RiskItem, material: MaterialRecord | None = None) -> Ris
     maturity = _information_maturity(risk, material)
     suggested_owner = _suggested_question_owner(owner, confirmation_method)
     missing_info = _missing_information(risk, material, tags, material_attribute)
-    followup_questions = _followup_questions(risk, material, owner, confirmation_method, material_attribute, tags, missing_info)
+    followup_questions = _followup_questions(risk, material, owner, confirmation_method, material_attribute, tags, maturity)
     basis = _classification_basis(risk, owner, confirmation_method, material_attribute, tags, material, maturity)
 
     risk.risk_confirmation_method = confirmation_method
@@ -246,6 +255,8 @@ def _material_index(materials: list[MaterialRecord]) -> dict[str, MaterialRecord
 
 
 def _has_classification(risk: RiskItem) -> bool:
+    if _needs_followup_question_refresh(risk):
+        return False
     return bool(
         risk.risk_confirmation_method
         or risk.primary_owner
@@ -262,7 +273,7 @@ def _fallback_classification(risk: RiskItem, reason: str) -> RiskItem:
     risk.material_attribute = risk.material_attribute or UNKNOWN
     risk.information_maturity = risk.information_maturity or MATURITY_POTENTIAL
     risk.suggested_question_owner = risk.suggested_question_owner or "项目采购代表先确认主设计/采购归口"
-    risk.followup_questions = risk.followup_questions or [f"请主设计确认“{risk.material_name or '该物料'}”在计划阶段是否需要提前关注。"]
+    risk.followup_questions = risk.followup_questions or [_build_reason_driven_question(risk, None, UNKNOWN, set())]
     risk.missing_information = risk.missing_information or ["对应BOM物料确认", "风险物料识别清单", "初步物料清单", "关键件选型/风险说明"]
     risk.classification_basis = risk.classification_basis or reason
     return risk
@@ -455,26 +466,86 @@ def _followup_questions(
     confirmation_method: str,
     material_attribute: str,
     tags: list[str],
-    missing_info: list[str],
+    maturity: str,
 ) -> list[str]:
+    if not _should_generate_followup_question(risk, material, maturity):
+        return [NO_FOLLOWUP_QUESTION]
+    return [_build_reason_driven_question(risk, material, owner, set(tags))]
+
+
+def _should_generate_followup_question(risk: RiskItem, material: MaterialRecord | None, maturity: str) -> bool:
+    """判断该风险是否需要进入问题分发清单。"""
+
+    if risk.risk_type in PRIORITY_QUESTION_RISK_TYPES:
+        return True
+    if risk.unresolved_questions:
+        return True
+    if maturity == MATURITY_POTENTIAL:
+        return True
+    return material is None and risk.material_name in {"待确认物料", "未知物料", ""}
+
+
+def _build_reason_driven_question(
+    risk: RiskItem,
+    material: MaterialRecord | None,
+    owner: str,
+    tags: set[str],
+) -> str:
+    """生成围绕风险原因和归口人的提问，不拼接资料补齐清单。"""
+
     name = risk.material_name or "该物料"
-    missing = _join_cn(missing_info[:3])
-    suffix = f"，并补充{missing}" if missing else ""
-    if material and material.has_children:
-        suffix += "，说明影响组件整体还是下级物料"
+    owner_label = _question_owner_label(owner)
+    reason = _sentence(_clip_text(risk.risk_reason or risk.source_basis or "当前资料显示该物料存在计划阶段采购风险", 72))
+    focus = _question_focus(risk.risk_type, tags)
+    scope = " 同时确认该风险影响组件整体还是下级物料。" if material and material.has_children else ""
+    return f"请{owner_label}确认“{name}”的{risk.risk_type}是否成立：{reason}重点确认：{focus}{scope}"
 
+
+def _question_owner_label(owner: str) -> str:
     if owner == OWNER_STRUCTURE:
-        core = f"请结构确认“{name}”是否是计划阶段需要提前关注的结构风险{suffix}。"
-    elif owner == OWNER_ELECTRONICS:
-        core = f"请电子确认“{name}”是否是计划阶段需要提前关注的电子风险{suffix}。"
-    elif owner == OWNER_PROCESS:
-        core = f"请工艺/质量确认“{name}”是否需要在计划阶段提前做可行性、DFM或检具判断{suffix}。"
-    elif owner == OWNER_PROCUREMENT:
-        core = f"请采购确认“{name}”在计划阶段是否存在长周期、齐套或供方能力风险{suffix}。"
-    else:
-        core = f"请主设计确认“{name}”是否应纳入计划阶段风险物料清单{suffix}。"
+        return "结构"
+    if owner == OWNER_ELECTRONICS:
+        return "电子"
+    if owner == OWNER_PROCESS:
+        return "工艺/质量"
+    if owner == OWNER_PROCUREMENT:
+        return "采购"
+    return "主设计"
 
-    return [core]
+
+def _question_focus(risk_type: str, tags: set[str]) -> str:
+    if risk_type == "新物料/新技术风险":
+        return "成熟方案、验证路径和可采购资源是否明确？"
+    if risk_type == "供应资源风险":
+        return "供应商资源、二供方案和供方能力是否明确？"
+    if risk_type == "长周期风险":
+        return "交期、齐套影响和备选方案是否明确？"
+    if risk_type == "定制工艺风险":
+        return "工艺可行性、加工周期和量产稳定性是否明确？"
+    if risk_type == "关键性能风险":
+        return "关键性能指标、验证方式和供应商能力是否明确？"
+    if risk_type == "成本达成风险":
+        return "目标成本、报价依据和降本空间是否明确？"
+    if risk_type == "质量验证风险":
+        return "来料检验、验证标准和量产一致性是否明确？"
+    if risk_type == "接口匹配风险":
+        return "接口边界、配合关系和变更影响是否明确？"
+    if {"认证", "认证资料", "通信法规", "电池法规"} & tags:
+        return "认证边界、法规要求和责任归口是否明确？"
+    return "风险判断依据、责任归口和后续处理方式是否明确？"
+
+
+def _needs_followup_question_refresh(risk: RiskItem) -> bool:
+    """识别旧版套话问题，导出前重新生成。"""
+
+    legacy_patterns = [
+        "并补充",
+        "是否是计划阶段需要提前关注",
+        "是否需要在计划阶段提前做可行性",
+        "在计划阶段是否存在长周期",
+        "是否应纳入计划阶段风险物料清单",
+    ]
+    return any(pattern in question for question in risk.followup_questions for pattern in legacy_patterns)
 
 
 def _classification_basis(
@@ -543,6 +614,20 @@ def _dedupe(values: list[str]) -> list[str]:
 def _join_cn(values: list[str]) -> str:
     clean = _dedupe(values)
     return "、".join(clean) if clean else "待确认信息"
+
+
+def _clip_text(value: str, limit: int) -> str:
+    clean = " ".join(str(value or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit].rstrip() + "..."
+
+
+def _sentence(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text if text.endswith(("。", "？", "！", ".", "?", "!")) else f"{text}。"
 
 
 def _material_scope(material: MaterialRecord | None) -> str:
